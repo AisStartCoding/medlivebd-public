@@ -1,0 +1,213 @@
+/**
+ * What a demo console needs in order to let somebody in (CLAUDE.md §4.1).
+ *
+ * "Under `DEMO_MODE=true`, the console picks a hospital and a role without a
+ * password. That is the correct implementation for a pitch version, not a
+ * shortcut to apologise for."
+ *
+ * So these reads answer one question: which hospitals are running something
+ * today, which staff accounts exist to act as, and which chambers are worth
+ * opening. Nothing here is reachable unless `DEMO_MODE` is on — the route
+ * refuses first — and nothing here returns a patient's name.
+ */
+
+import { sql } from 'kysely';
+
+import { db } from '../config/db.js';
+
+import { todaysChambers } from './chamber.repo.js';
+import { listDesks, type DeskRow } from './hospitalSettings.repo.js';
+
+/** A chamber a demo console can open. */
+export interface DemoSessionRow {
+  readonly id: string;
+  /** What a reception desk is assigned (`FR-REC-32`). */
+  readonly doctorId: string;
+  readonly doctorNameBn: string;
+  readonly doctorNameEn: string;
+  readonly departmentNameBn: string;
+  readonly departmentNameEn: string;
+  readonly room: string | null;
+  readonly status: string;
+  /** The chamber's own date, and whether that is today (`chamber.repo`). */
+  readonly sessionDate: string;
+  readonly today: boolean;
+  readonly plannedStart: string;
+  readonly plannedEnd: string;
+  readonly waiting: number;
+  readonly total: number;
+}
+
+/** A hospital, the roles there are accounts for, and today's chambers. */
+export interface DemoConsoleRow {
+  readonly hospitalId: string;
+  readonly nameBn: string;
+  readonly nameEn: string;
+  readonly district: string;
+  readonly roles: readonly string[];
+  readonly sessions: readonly DemoSessionRow[];
+  /** Its reception desks and their doctors (`FR-REC-32`, plan R4). */
+  readonly desks: readonly DeskRow[];
+}
+
+/**
+ * Roles whose console opens on the facility rather than on one chamber: the
+ * ward board, the ER, the lab, the pharmacy and the dashboard (`S-B-06` to
+ * `S-B-10`). Such a console is worth offering on a day with no chambers.
+ */
+const FACILITY_ROLES: ReadonlySet<string> = new Set([
+  'ward',
+  'emergency',
+  'lab',
+  'pharmacy',
+  'hospital_admin',
+]);
+
+/**
+ * Every live facility with a staff account, and what it is running now.
+ *
+ * "Now" rather than "today": a session still running from the previous Dhaka
+ * day counts, because a receptionist whose chamber has not closed yet needs
+ * their console at one in the morning as much as at nine at night.
+ *
+ * Ordered so the chamber the pitch opens on comes first: a session already
+ * mid-queue is the one that demonstrates the product, and making somebody hunt
+ * for it is the difference between a demo that lands and one that explains
+ * itself. `FR-DEM-06` builds exactly one of those.
+ */
+export async function listConsoles(): Promise<DemoConsoleRow[]> {
+  const hospitals = await sql<{
+    hospital_id: string;
+    name_bn: string;
+    name_en: string;
+    district: string;
+    roles: string[];
+  }>`
+    SELECT h.id AS hospital_id, h.name_bn, h.name_en, h.district,
+           array_agg(DISTINCT sr.role::text) AS roles
+      FROM hospitals h
+      JOIN staff_users su ON su.hospital_id = h.id AND su.deleted_at IS NULL
+      JOIN staff_roles sr ON sr.staff_user_id = su.id AND sr.deleted_at IS NULL
+     WHERE h.is_live AND h.deleted_at IS NULL
+     GROUP BY h.id, h.name_bn, h.name_en, h.district
+     ORDER BY h.name_en
+  `.execute(db);
+
+  const sessions = await todaysChambers(null);
+  const desks = await Promise.all(
+    hospitals.rows.map(async (row) => [row.hospital_id, await listDesks(row.hospital_id)] as const),
+  );
+  const desksOf = new Map(desks);
+
+  const byHospital = new Map<string, DemoSessionRow[]>();
+  for (const { hospitalId, ...session } of sessions) {
+    const list = byHospital.get(hospitalId) ?? [];
+    list.push(session);
+    byHospital.set(hospitalId, list);
+  }
+
+  return (
+    hospitals.rows
+      .map((row) => ({
+        hospitalId: row.hospital_id,
+        nameBn: row.name_bn,
+        nameEn: row.name_en,
+        district: row.district,
+        roles: [...row.roles].sort(),
+        sessions: byHospital.get(row.hospital_id) ?? [],
+        desks: desksOf.get(row.hospital_id) ?? [],
+      }))
+      // A facility is worth opening if a chamber sits there today, or if it
+      // staffs a console that belongs to the building rather than to a
+      // chamber. A ward, an ER, a lab or a pharmacy does not close for the
+      // weekend: on a Friday only the government college and the clinic sit
+      // chambers (`seed_02`, FRIDAY_CHAMBERS), and filtering on sessions alone
+      // hid the other four facilities' ward boards and ER consoles all day.
+      .filter(
+        (hospital) =>
+          hospital.sessions.length > 0 || hospital.roles.some((role) => FACILITY_ROLES.has(role)),
+      )
+      .sort((a, b) => runningFirst(b) - runningFirst(a))
+  );
+}
+
+function runningFirst(hospital: { sessions: readonly DemoSessionRow[] }): number {
+  return hospital.sessions.some((session) => session.status === 'running') ? 1 : 0;
+}
+
+/**
+ * The national roles a seeded account holds (`FR-ROLE-01`, 0024).
+ *
+ * Both halves of "national" are checked: the role row has no hospital *and*
+ * the account has none. A hospital's staff member given a national role by
+ * mistake would otherwise surface here and be offered as a government viewer.
+ */
+export async function nationalRoles(): Promise<string[]> {
+  const result = await sql<{ role: string }>`
+    SELECT DISTINCT sr.role::text AS role
+      FROM staff_roles sr
+      JOIN staff_users su ON su.id = sr.staff_user_id
+     WHERE sr.hospital_id IS NULL
+       AND su.hospital_id IS NULL
+       AND sr.deleted_at IS NULL
+       AND su.deleted_at IS NULL
+     ORDER BY 1
+  `.execute(db);
+
+  return result.rows.map((row) => row.role);
+}
+
+/**
+ * A real national account holding this role — real for `nationalRoles`' reason.
+ * The seeded demonstration account first (`FR-DEM-07`): one created later, by
+ * an administrator or a test, never takes over the picker.
+ */
+export async function nationalStaffFor(
+  role: string,
+): Promise<{ readonly id: string; readonly fullName: string } | null> {
+  const result = await sql<{ id: string; full_name: string }>`
+    SELECT su.id, su.full_name
+      FROM staff_users su
+      JOIN staff_roles sr ON sr.staff_user_id = su.id
+     WHERE su.hospital_id IS NULL
+       AND sr.hospital_id IS NULL
+       AND sr.role = ${role}::staff_role
+       AND sr.deleted_at IS NULL
+       AND su.deleted_at IS NULL
+       AND sr.deleted_at IS NULL
+     ORDER BY (sr.scope @> '{"demo": true}'::jsonb) DESC, su.full_name
+     LIMIT 1
+  `.execute(db);
+
+  const row = result.rows[0];
+  return row === undefined ? null : { id: row.id, fullName: row.full_name };
+}
+
+/**
+ * A real staff account at this hospital holding this role.
+ *
+ * Real, not invented: `queue_events.actor_staff_id` is a foreign key, so a
+ * token minted for an id that does not exist produces a console whose every
+ * action is refused by the database. `FR-QUE-04` — an unattributable queue
+ * action cannot be recorded at all — is what makes that the right behaviour.
+ * The seeded demonstration account comes first, as in `nationalStaffFor`.
+ */
+export async function staffFor(
+  hospitalId: string,
+  role: string,
+): Promise<{ readonly id: string; readonly fullName: string } | null> {
+  const result = await sql<{ id: string; full_name: string }>`
+    SELECT su.id, su.full_name
+      FROM staff_users su
+      JOIN staff_roles sr ON sr.staff_user_id = su.id
+     WHERE su.hospital_id = ${hospitalId}::uuid
+       AND sr.role = ${role}::staff_role
+       AND sr.deleted_at IS NULL
+       AND su.deleted_at IS NULL
+     ORDER BY (sr.scope @> '{"demo": true}'::jsonb) DESC, su.full_name
+     LIMIT 1
+  `.execute(db);
+
+  const row = result.rows[0];
+  return row === undefined ? null : { id: row.id, fullName: row.full_name };
+}

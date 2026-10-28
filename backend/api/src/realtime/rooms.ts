@@ -1,0 +1,145 @@
+/**
+ * Room naming, and who is allowed into each (BACKEND.md §6).
+ *
+ * Names are built here and nowhere else. A room name assembled by hand in a
+ * service is one typo away from a broadcast that reaches nobody — and the
+ * failure is silent, because emitting into a room with no members succeeds.
+ * The two-device test would catch it for `session:`; nothing would catch it
+ * for the rest.
+ *
+ * The membership rules are here too, as pure predicates over a principal, so
+ * the socket handshake and the HTTP layer answer "may this caller see this
+ * session" the same way.
+ */
+
+import type { Principal } from '../types/express.js';
+
+/** Every room kind in BACKEND.md §6. */
+export const ROOMS = {
+  /**
+   * Patients with a booking in the chamber. They are sent the patients' copy
+   * of the queue, which names nobody (plan I2c, `queue/patientView`).
+   */
+  session: (sessionId: string): string => `session:${sessionId}`,
+  /** The chamber's reception console and doctor's screen: the queue as reception holds it. */
+  sessionStaff: (sessionId: string): string => `session:${sessionId}:staff`,
+  beds: (hospitalId: string): string => `hospital:${hospitalId}:beds`,
+  emergency: (hospitalId: string): string => `hospital:${hospitalId}:emergency`,
+  lab: (hospitalId: string): string => `hospital:${hospitalId}:lab`,
+  admin: (hospitalId: string): string => `hospital:${hospitalId}:admin`,
+  /** That patient's own devices. */
+  patient: (patientId: string): string => `patient:${patientId}`,
+  // No room per referral: both ends hear `referral.*` in their own emergency
+  // room, which every ER console is already in (`emit.referralUpdated`).
+} as const;
+
+/** The events a session room carries (BACKEND.md §6). */
+export type SessionEvent = 'queue.updated' | 'session.delayed' | 'session.ended' | 'patient.called';
+
+/**
+ * The envelope every realtime payload uses (BACKEND.md §6).
+ *
+ * `seq` is what a reconnecting client resumes from, so it is present on
+ * anything derived from the log and absent on anything that is not. `serverTs`
+ * is always present, because a client that cannot tell how old a payload is
+ * cannot render a freshness line (`FR-OFF-03`).
+ */
+export interface RealtimeEnvelope<T = unknown> {
+  readonly type: string;
+  readonly seq?: number;
+  readonly serverTs: string;
+  /**
+   * On a `queue.updated` only: the console actions this statement of the
+   * queue has just taken in, by the console's own key (`SY-08`).
+   */
+  readonly applied?: readonly AppliedAction[];
+  readonly data: T;
+}
+
+/**
+ * One console action a statement of the queue contains (`SY-08`).
+ *
+ * The key is the console's, generated at the tap; the sequence and the event
+ * id are what the log made of it. A console that finds its own key here stops
+ * drawing the action on top of the queue, because the queue now holds it.
+ * To anybody else the three are opaque: a random key, a counter, a random id.
+ */
+export interface AppliedAction {
+  readonly clientEventId: string;
+  readonly seq: number;
+  readonly eventId: string;
+}
+
+/**
+ * May this principal join this session's room?
+ *
+ * Staff must be scoped to the hospital running the session. A patient or a
+ * guest must hold a booking in it — which the caller resolves, because this
+ * function has no I/O and the answer depends on rows.
+ *
+ * Fails closed on an unknown kind, like every other guard in this codebase.
+ */
+export function canJoinSession(
+  principal: Principal | undefined,
+  context: {
+    readonly hospitalId: string;
+    /** True when this principal holds a booking in the session. */
+    readonly holdsBooking: boolean;
+  },
+): boolean {
+  if (principal === undefined) return false;
+
+  switch (principal.kind) {
+    case 'staff':
+      return (
+        principal.hospitalId === context.hospitalId &&
+        principal.roles.some((role) => ['receptionist', 'doctor', 'hospital_admin'].includes(role))
+      );
+    case 'patient':
+    case 'guest':
+      return context.holdsBooking;
+    case 'national':
+      // A chamber's room carries patients' serials and names; the national
+      // layer reads aggregates over HTTP and has no room (`FR-GOV-06`).
+      return false;
+  }
+}
+
+/** Every room a principal is entitled to without any row lookup. */
+export function ambientRoomsFor(principal: Principal, off: readonly string[] = []): string[] {
+  switch (principal.kind) {
+    case 'staff':
+      // A console subscribes to its own hospital's boards; which of them it
+      // actually listens on is the client's choice, and joining costs nothing
+      // it is not already allowed to read.
+      // The existing HTTP board-read roles/modules, not every staff member
+      // (FR-ROLE-01, FR-SEC-06). Public board reads remain separate.
+      return [
+        {
+          module: 'beds',
+          roles: ['ward', 'emergency', 'receptionist', 'doctor', 'hospital_admin'],
+          room: ROOMS.beds(principal.hospitalId),
+        },
+        {
+          module: 'emergency',
+          roles: ['emergency', 'hospital_admin'],
+          room: ROOMS.emergency(principal.hospitalId),
+        },
+        { module: 'lab', roles: ['lab', 'hospital_admin'], room: ROOMS.lab(principal.hospitalId) },
+        { module: 'dashboard', roles: ['hospital_admin'], room: ROOMS.admin(principal.hospitalId) },
+      ]
+        .filter(
+          (entry) =>
+            !off.includes(entry.module) &&
+            principal.roles.some((role) => entry.roles.includes(role)),
+        )
+        .map((entry) => entry.room);
+    case 'patient':
+      return [];
+    case 'guest':
+      // A tracking link is scoped to one booking and nothing else (FR-GST-05).
+      return [];
+    case 'national':
+      return [];
+  }
+}

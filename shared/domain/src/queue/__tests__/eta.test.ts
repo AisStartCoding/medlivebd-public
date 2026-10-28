@@ -1,0 +1,566 @@
+/**
+ * ETA maths (FR-QUE-11..15).
+ *
+ * The number a waiting family reads, so the tests are written from their side:
+ * what does the screen say, and is it the kind of wrong that costs an hour in
+ * a corridor or the kind that costs a missed turn.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import { serial, timestamp, type BookingId, type Timestamp } from '../../types/ids.js';
+import { differenceInMinutes } from '../../util/time.js';
+import {
+  bandMinutes,
+  computeEtas,
+  earlierThanTold,
+  etaFor,
+  outstandingDelayMinutes,
+  projectedEnd,
+  shouldLeaveNow,
+  twoAwayBookings,
+  MAX_BAND_MINUTES,
+  MIN_BAND_MINUTES,
+} from '../eta.js';
+import { reduce } from '../reducer.js';
+import { emptyState, type QueueState } from '../state.js';
+
+import { bookingId, LogBuilder, makeSeed } from './support.js';
+
+const PLANNED_START = timestamp('2026-09-17T11:00:00.000Z');
+
+/** A session with `size` patients and an eight-minute default consultation. */
+function session(size = 6): { state: QueueState; log: LogBuilder } {
+  const seed = makeSeed(size, { defaultConsultSeconds: 480 });
+  return { state: emptyState(seed), log: new LogBuilder(seed.plan.sessionId) };
+}
+
+function fold(state: QueueState, events: readonly Parameters<typeof reduce>[1][]): QueueState {
+  return events.reduce(reduce, state);
+}
+
+function arrive(log: LogBuilder, at: Timestamp): Parameters<typeof reduce>[1] {
+  return log.next('DOCTOR_ARRIVED', { arrivedAt: at, minutesLate: 0 });
+}
+
+describe('before the doctor arrives', () => {
+  it('counts from the planned start, not from now', () => {
+    const { state } = session(4);
+    const now = timestamp('2026-09-17T10:30:00.000Z');
+
+    const etas = computeEtas(state, now);
+
+    expect(etas).toHaveLength(4);
+    expect(etas[0]?.etaAt).toBe(PLANNED_START);
+    // Eight minutes per patient.
+    expect(differenceInMinutes(etas[1]?.etaAt ?? now, PLANNED_START)).toBe(8);
+  });
+
+  it('will not claim the planned start once it has passed', () => {
+    const { state } = session(3);
+    const now = timestamp('2026-09-17T11:40:00.000Z');
+
+    const etas = computeEtas(state, now);
+
+    // A session due at five that has not begun at half past does not get to
+    // keep promising five.
+    expect(etas[0]?.etaAt).toBe(timestamp('2026-09-17T11:40:00.000Z'));
+  });
+
+  it('says it does not know, rather than offering false precision', () => {
+    const { state } = session(3);
+    const etas = computeEtas(state, timestamp('2026-09-17T10:30:00.000Z'));
+
+    expect(etas[0]?.confidence).toBe('unknown');
+    expect(etas[0]?.bandMinutes).toBe(MAX_BAND_MINUTES);
+  });
+
+  it('pushes every estimate back by a declared delay (FR-PAT-34)', () => {
+    const { state, log } = session(3);
+    const now = timestamp('2026-09-17T10:30:00.000Z');
+
+    const delayed = reduce(
+      state,
+      log.next('DELAY_DECLARED', { minutes: 30, reason: 'surgery', declaredBy: 'doctor' }),
+    );
+
+    const before = computeEtas(state, now)[0]?.etaAt ?? now;
+    const after = computeEtas(delayed, now)[0]?.etaAt ?? now;
+
+    expect(differenceInMinutes(after, before)).toBe(30);
+  });
+});
+
+describe('once the chamber is running', () => {
+  it('multiplies the measured rate by the patients ahead (FR-QUE-11)', () => {
+    const { state, log } = session(5);
+    const now = timestamp('2026-09-17T11:20:00.000Z');
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+    ]);
+
+    // One measurement of five minutes replaces the eight-minute default.
+    expect(running.rate.currentSeconds).toBe(300);
+
+    const etas = computeEtas(running, now);
+    expect(etas[0]?.etaAt).toBe(now);
+    expect(differenceInMinutes(etas[1]?.etaAt ?? now, now)).toBe(5);
+    expect(differenceInMinutes(etas[2]?.etaAt ?? now, now)).toBe(10);
+  });
+
+  it('credits time already spent in the chamber, so the next patient is not promised a full slot', () => {
+    const { state, log } = session(4);
+    const calledAt = timestamp('2026-09-17T11:10:00.000Z');
+    const now = timestamp('2026-09-17T11:14:00.000Z');
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.advance(600).next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    ]);
+
+    expect(running.entries[0]?.calledAt).toBe(calledAt);
+
+    const etas = computeEtas(running, now);
+    // Four of the eight minutes are already spent, so the next patient is
+    // about four minutes away rather than eight.
+    expect(differenceInMinutes(etas[0]?.etaAt ?? now, now)).toBe(4);
+    expect(etas[0]?.patientsAhead).toBe(1);
+  });
+
+  it('never promises a time in the past for the patient in the chamber', () => {
+    const { state, log } = session(3);
+    const now = timestamp('2026-09-17T12:30:00.000Z');
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.advance(60).next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    ]);
+
+    for (const eta of computeEtas(running, now)) {
+      expect(eta.etaAt >= now).toBe(true);
+    }
+  });
+
+  it('reports measured confidence only once a consultation has been timed', () => {
+    const { state, log } = session(4);
+    const now = timestamp('2026-09-17T11:05:00.000Z');
+
+    const arrived = reduce(state, arrive(log, PLANNED_START));
+    expect(computeEtas(arrived, now)[0]?.confidence).toBe('estimated');
+
+    const measured = fold(arrived, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(420).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 420 }),
+    ]);
+    expect(computeEtas(measured, now)[0]?.confidence).toBe('measured');
+  });
+});
+
+describe('a declared delay and the arrival (FR-QUE-11, FR-REC-03)', () => {
+  const delay = (log: LogBuilder, minutes: number): Parameters<typeof reduce>[1] =>
+    log.next('DELAY_DECLARED', { minutes, reason: 'traffic', declaredBy: 'reception' });
+
+  it('is used up when the doctor arrives: the first patient is next, not half an hour away', () => {
+    const { state, log } = session(4);
+    // Thirty minutes declared before the chamber opens; the doctor walks in
+    // at 11:32, two minutes after the time the delay promised.
+    const arrivedAt = timestamp('2026-09-17T11:32:00.000Z');
+
+    const arrived = fold(state, [
+      delay(log, 30),
+      log.advance(1920).next('DOCTOR_ARRIVED', { arrivedAt, minutesLate: 32 }),
+    ]);
+
+    const etas = computeEtas(arrived, arrivedAt);
+    // The doctor is in the room and the chamber is empty.
+    expect(etas[0]?.etaAt).toBe(arrivedAt);
+    expect(differenceInMinutes(etas[1]?.etaAt ?? arrivedAt, arrivedAt)).toBe(8);
+    expect(outstandingDelayMinutes(arrived, arrivedAt)).toBe(0);
+    // What was declared is still on record for the day's figures.
+    expect(arrived.delayMinutes).toBe(30);
+    expect(projectedEnd(arrived, arrivedAt)).toBe(timestamp('2026-09-17T12:04:00.000Z'));
+  });
+
+  it('is the whole of what is outstanding until the doctor arrives', () => {
+    const { state, log } = session(3);
+    const delayed = fold(state, [delay(log, 30), delay(log, 15)]);
+
+    expect(outstandingDelayMinutes(delayed, timestamp('2026-09-17T10:30:00.000Z'))).toBe(45);
+  });
+
+  it('holds the chamber when it is declared after the doctor arrived', () => {
+    const { state, log } = session(4);
+    // The doctor is called away at 11:20 for half an hour.
+    const held = fold(state, [arrive(log, PLANNED_START), delay(log.advance(1200), 30)]);
+    const now = timestamp('2026-09-17T11:25:00.000Z');
+
+    expect(held.hold).toEqual({ until: timestamp('2026-09-17T11:50:00.000Z'), minutes: 30 });
+    expect(computeEtas(held, now)[0]?.etaAt).toBe(timestamp('2026-09-17T11:50:00.000Z'));
+    // The figure declared, for as long as the hold runs — not a countdown.
+    expect(outstandingDelayMinutes(held, now)).toBe(30);
+  });
+
+  it('stops holding once the declared time has passed', () => {
+    const { state, log } = session(4);
+    const held = fold(state, [arrive(log, PLANNED_START), delay(log.advance(1200), 30)]);
+    const now = timestamp('2026-09-17T12:05:00.000Z');
+
+    expect(computeEtas(held, now)[0]?.etaAt).toBe(now);
+    expect(outstandingDelayMinutes(held, now)).toBe(0);
+  });
+
+  it('extends a hold that is still running, rather than starting a second one', () => {
+    const { state, log } = session(4);
+    const held = fold(state, [
+      arrive(log, PLANNED_START),
+      delay(log.advance(1200), 30),
+      delay(log.advance(600), 15),
+    ]);
+
+    // 11:20 + 30 + 15, not 11:30 + 15.
+    expect(held.hold).toEqual({ until: timestamp('2026-09-17T12:05:00.000Z'), minutes: 45 });
+  });
+});
+
+describe('a paused session (FR-REC-05)', () => {
+  it('stops claiming to know, because nothing can know when a prayer break ends', () => {
+    const { state, log } = session(4);
+    const now = timestamp('2026-09-17T11:30:00.000Z');
+
+    const paused = fold(state, [
+      arrive(log, PLANNED_START),
+      log.advance(600).next('SESSION_PAUSED', { reason: 'prayer' }),
+    ]);
+
+    const etas = computeEtas(paused, now);
+    expect(etas[0]?.confidence).toBe('unknown');
+    expect(etas[0]?.bandMinutes).toBe(MAX_BAND_MINUTES);
+    expect(projectedEnd(paused, now)).toBeNull();
+  });
+});
+
+describe('the confidence band (FR-QUE-13)', () => {
+  it('widens with the number of patients ahead', () => {
+    const spread = 180;
+    const near = bandMinutes(1, spread, 'measured');
+    const far = bandMinutes(16, spread, 'measured');
+
+    expect(far).toBeGreaterThan(near);
+  });
+
+  it('grows more slowly than the queue, because errors partly cancel', () => {
+    const spread = 180;
+    const one = bandMinutes(1, spread, 'measured');
+    const sixteen = bandMinutes(16, spread, 'measured');
+
+    // Sixteen times the patients is four times the uncertainty, not sixteen.
+    expect(sixteen).toBeLessThan(one * 16);
+  });
+
+  it('never claims a band narrower than five minutes', () => {
+    expect(bandMinutes(0, 1, 'measured')).toBe(MIN_BAND_MINUTES);
+  });
+
+  it('never shows a band wider than forty-five minutes', () => {
+    expect(bandMinutes(500, 3600, 'measured')).toBe(MAX_BAND_MINUTES);
+  });
+
+  it('is at its widest when the session is not running', () => {
+    expect(bandMinutes(1, 60, 'unknown')).toBe(MAX_BAND_MINUTES);
+  });
+
+  it('is tighter for a chamber running to a rhythm than one that is not', () => {
+    const steady = bandMinutes(5, 60, 'measured');
+    const erratic = bandMinutes(5, 600, 'measured');
+
+    expect(steady).toBeLessThan(erratic);
+  });
+});
+
+describe('an ETA that moves earlier (FR-QUE-15)', () => {
+  it('is flagged, so the patient can be told before their turn arrives early', () => {
+    const { state, log } = session(5);
+    const now = timestamp('2026-09-17T11:00:00.000Z');
+
+    // The queue shortens: two patients ahead cancel.
+    const shortened = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('BOOKING_CANCELLED', { bookingId: bookingId(1), reason: 'cancelled' }),
+      log.next('BOOKING_CANCELLED', { bookingId: bookingId(2), reason: 'cancelled' }),
+    ]);
+
+    const previous = new Map<BookingId, Timestamp>([
+      [bookingId(3), timestamp('2026-09-17T11:30:00.000Z')],
+    ]);
+
+    const eta = etaFor(shortened, bookingId(3), now, { previous });
+
+    expect(eta?.movedEarlier).toBe(true);
+  });
+
+  it('is not flagged when the estimate slips later, which needs no warning', () => {
+    const { state, log } = session(4);
+    const now = timestamp('2026-09-17T11:00:00.000Z');
+
+    const delayed = reduce(
+      state,
+      log.next('DELAY_DECLARED', { minutes: 30, reason: null, declaredBy: 'reception' }),
+    );
+
+    const previous = new Map<BookingId, Timestamp>([
+      [bookingId(1), timestamp('2026-09-17T11:00:00.000Z')],
+    ]);
+
+    expect(etaFor(delayed, bookingId(1), now, { previous })?.movedEarlier).toBe(false);
+  });
+
+  it('is not flagged when nothing was previously communicated', () => {
+    const { state } = session(3);
+    const eta = etaFor(state, bookingId(1), timestamp('2026-09-17T10:00:00.000Z'));
+
+    expect(eta?.movedEarlier).toBe(false);
+  });
+});
+
+describe('earlier than a patient was told (FR-QUE-15)', () => {
+  const NOTHING_TOLD = new Map<BookingId, Timestamp>();
+
+  /** A running chamber of six: the doctor in at the planned start, serial 1 called. */
+  function running(): { state: QueueState; log: LogBuilder } {
+    const { state, log } = session(6);
+    return {
+      state: fold(state, [
+        arrive(log, PLANNED_START),
+        log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      ]),
+      log,
+    };
+  }
+
+  const who = (etas: readonly { readonly bookingId: BookingId }[]): BookingId[] =>
+    etas.map((eta) => eta.bookingId);
+
+  it('names nobody while every estimate is at or after what was told', () => {
+    const { state } = running();
+    const etas = computeEtas(state, PLANNED_START);
+    // Told the planned start by the confirmation; every turn is at or after it.
+    expect(earlierThanTold(state, etas, NOTHING_TOLD, PLANNED_START)).toEqual([]);
+  });
+
+  it('names a patient whose estimate has come forward past its band', () => {
+    const { state } = running();
+    const etas = computeEtas(state, PLANNED_START);
+    const fifth = etas.find((eta) => eta.bookingId === bookingId(5));
+    if (fifth === undefined) throw new Error('serial 5 has no estimate');
+
+    // Told a time well after the estimate now stands: by more than the band.
+    const toldLate = new Map<BookingId, Timestamp>([
+      [bookingId(5), timestamp('2026-09-17T13:00:00.000Z')],
+    ]);
+    expect(who(earlierThanTold(state, etas, toldLate, PLANNED_START))).toEqual([bookingId(5)]);
+
+    // Told a time the estimate is still inside the band of: that is an
+    // estimate being an estimate, and nobody is woken for it.
+    const inside = new Date(Date.parse(fifth.etaAt) + fifth.bandMinutes * 60_000).toISOString();
+    const toldClose = new Map<BookingId, Timestamp>([[bookingId(5), timestamp(inside)]]);
+    expect(earlierThanTold(state, etas, toldClose, PLANNED_START)).toEqual([]);
+
+    // One minute past the band is past it.
+    const past = new Date(Date.parse(inside) + 60_000).toISOString();
+    expect(
+      who(
+        earlierThanTold(
+          state,
+          etas,
+          new Map<BookingId, Timestamp>([[bookingId(5), timestamp(past)]]),
+          PLANNED_START,
+        ),
+      ),
+    ).toEqual([bookingId(5)]);
+  });
+
+  it('falls back to the planned start, the time in the confirmation', () => {
+    // The doctor came in forty minutes early and nobody has been told a time
+    // since the booking: everybody's turn is now before the planned start.
+    const { state, log } = session(4);
+    const early = timestamp('2026-09-17T10:20:00.000Z');
+    const begun = fold(state, [arrive(log, early)]);
+    const etas = computeEtas(begun, early);
+
+    expect(who(earlierThanTold(begun, etas, NOTHING_TOLD, PLANNED_START))).toContain(bookingId(1));
+  });
+
+  it('does not warn about a time the chamber cannot support', () => {
+    // Not arrived: the estimate is shown as no time at all, so there is no
+    // earlier time on any screen to warn about.
+    const { state } = session(4);
+    const now = timestamp('2026-09-17T10:00:00.000Z');
+    const etas = computeEtas(state, now);
+    const toldLate = new Map<BookingId, Timestamp>([
+      [bookingId(2), timestamp('2026-09-17T15:00:00.000Z')],
+    ]);
+    expect(earlierThanTold(state, etas, toldLate, PLANNED_START)).toEqual([]);
+  });
+
+  it('leaves out a patient reception has checked in: the corridor tells them', () => {
+    const { state, log } = running();
+    const checkedIn = reduce(
+      state,
+      log.next('PATIENT_ARRIVED', { bookingId: bookingId(5), quotedWaitMinutes: 20 }),
+    );
+    const etas = computeEtas(checkedIn, PLANNED_START);
+    const toldLate = new Map<BookingId, Timestamp>([
+      [bookingId(5), timestamp('2026-09-17T13:00:00.000Z')],
+      [bookingId(6), timestamp('2026-09-17T13:00:00.000Z')],
+    ]);
+    expect(who(earlierThanTold(checkedIn, etas, toldLate, PLANNED_START))).toEqual([bookingId(6)]);
+  });
+});
+
+describe('the leave-home alert (FR-PAT-32)', () => {
+  it('fires when the remaining wait has shrunk to travel time plus buffer', () => {
+    // Twelve patients at eight minutes each, so the back of the queue is
+    // comfortably beyond a 25-minute journey and the front is not.
+    const { state, log } = session(12);
+    const now = timestamp('2026-09-17T11:00:00.000Z');
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(480).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 480 }),
+    ]);
+
+    const nextUp = etaFor(running, bookingId(2), now);
+    const farOff = etaFor(running, bookingId(12), now);
+
+    expect(nextUp).not.toBeNull();
+    expect(farOff).not.toBeNull();
+    if (nextUp === null || farOff === null) return;
+
+    expect(shouldLeaveNow(nextUp, now, 25)).toBe(true);
+    expect(shouldLeaveNow(farOff, now, 25)).toBe(false);
+  });
+
+  it('does not fire when the session has not started, because the trigger would be a guess', () => {
+    const { state } = session(4);
+    const now = timestamp('2026-09-17T10:00:00.000Z');
+    const eta = etaFor(state, bookingId(1), now);
+
+    expect(eta).not.toBeNull();
+    if (eta === null) return;
+    expect(shouldLeaveNow(eta, now, 600)).toBe(false);
+  });
+});
+
+describe('the two-away notice (FR-NOT-03)', () => {
+  it('names the patient two places from the chamber', () => {
+    const { state, log } = session(6);
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    ]);
+
+    // Serial 1 is in the chamber, so serial 2 is next and serial 3 is two away.
+    expect(twoAwayBookings(running)).toEqual([bookingId(3)]);
+  });
+
+  it('names nobody when the queue is too short for the notice to mean anything', () => {
+    const { state, log } = session(2);
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    ]);
+
+    expect(twoAwayBookings(running)).toEqual([]);
+  });
+});
+
+describe('projectedEnd', () => {
+  it('estimates when the session will finish', () => {
+    const { state, log } = session(5);
+    const now = timestamp('2026-09-17T11:00:00.000Z');
+
+    const running = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(600).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 600 }),
+    ]);
+
+    // Four left at ten minutes each.
+    expect(differenceInMinutes(projectedEnd(running, now) ?? now, now)).toBe(40);
+  });
+
+  it('is null once nobody is left to see', () => {
+    const { state, log } = session(1);
+    const now = timestamp('2026-09-17T11:30:00.000Z');
+
+    const finished = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+    ]);
+
+    expect(projectedEnd(finished, now)).toBeNull();
+  });
+});
+
+describe('performance (NFR-03, FR-QUE-14)', () => {
+  it('recalculates a hundred-patient session well inside 500 ms', () => {
+    const seed = makeSeed(100, { defaultConsultSeconds: 480 });
+    const log = new LogBuilder(seed.plan.sessionId);
+    const now = timestamp('2026-09-17T11:30:00.000Z');
+
+    const running = fold(emptyState(seed), [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(420).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 420 }),
+    ]);
+
+    const startedAt = Date.now();
+    const etas = computeEtas(running, now);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(etas).toHaveLength(99);
+    expect(elapsedMs).toBeLessThan(500);
+  });
+});
+
+describe('settled patients get no estimate', () => {
+  it('leaves out the done, the absent and the cancelled', () => {
+    const { state, log } = session(5);
+    const now = timestamp('2026-09-17T11:20:00.000Z');
+
+    const later = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+      log.next('PATIENT_NO_SHOW', { bookingId: bookingId(2), graceUsedMinutes: 16 }),
+      log.next('BOOKING_CANCELLED', { bookingId: bookingId(3), reason: 'cancelled' }),
+    ]);
+
+    expect(computeEtas(later, now).map((eta) => eta.serial)).toEqual([4, 5]);
+  });
+
+  it('still gives a late patient an estimate, at their new place in the queue', () => {
+    const { state, log } = session(5);
+    const now = timestamp('2026-09-17T11:00:00.000Z');
+
+    const late = fold(state, [
+      arrive(log, PLANNED_START),
+      log.next('PATIENT_LATE', {
+        bookingId: bookingId(1),
+        expectedMinutes: 20,
+        reinsertAfter: 3,
+      }),
+    ]);
+
+    const eta = etaFor(late, bookingId(1), now);
+    expect(eta).not.toBeNull();
+    expect(eta?.patientsAhead).toBe(3);
+  });
+});

@@ -1,0 +1,990 @@
+/**
+ * The guards (FR-QUE-20..22, FR-REC-14, FR-REC-15).
+ *
+ * Each of these protects a patient rather than the schema, so the tests are
+ * written around the situation being prevented: the person who stepped out to
+ * find a toilet, the one stuck in traffic, the one moved up the queue without
+ * a recorded reason.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import { QUEUE_EVENT_TYPES } from '../../types/enums.js';
+import { id, serial, timestamp } from '../../types/ids.js';
+import { etaFor } from '../eta.js';
+import { QUOTE_STEP_MINUTES, suggestedQuote } from '../quote.js';
+import { reduce } from '../reducer.js';
+import {
+  canAcceptSlot,
+  canAddWalkin,
+  canCallNext,
+  canReplayOffline,
+  canCheckIn,
+  canDeclareDelay,
+  canDeclareDoctorArrived,
+  canDeclareLate,
+  canEndSession,
+  canMarkDone,
+  canMarkNoShow,
+  canPause,
+  canReinstate,
+  canReorder,
+  canResume,
+  graceRemaining,
+  graceWindowMinutes,
+  canOfferFreedSlot,
+  hasCapacity,
+  lapsedOffers,
+  nextToCall,
+  unseenAtEnd,
+  DEFAULT_QUEUE_SETTINGS,
+  OFFLINE_ACTION_ROLES,
+  MAX_DELAY_MINUTES,
+  MAX_QUOTED_WAIT_MINUTES,
+} from '../rules.js';
+import { emptyState, type QueueState } from '../state.js';
+
+import { bookingId, LogBuilder, makeSeed } from './support.js';
+
+import type { BookingId, PatientId, SlotOfferId } from '../../types/ids.js';
+import type { OfflineAction } from '../rules.js';
+
+const PLANNED_START = timestamp('2026-09-17T11:00:00.000Z');
+
+function session(size = 5): { state: QueueState; log: LogBuilder } {
+  const seed = makeSeed(size);
+  return { state: emptyState(seed), log: new LogBuilder(seed.plan.sessionId) };
+}
+
+function fold(state: QueueState, events: readonly Parameters<typeof reduce>[1][]): QueueState {
+  return events.reduce(reduce, state);
+}
+
+/** A running session with the doctor in and nobody in the chamber. */
+function running(size = 5): { state: QueueState; log: LogBuilder } {
+  const { state, log } = session(size);
+  return {
+    state: reduce(state, log.next('DOCTOR_ARRIVED', { arrivedAt: PLANNED_START, minutesLate: 0 })),
+    log,
+  };
+}
+
+describe('the documented defaults', () => {
+  it('match FR-QUE-20, FR-QUE-21 and FR-OFF-04', () => {
+    expect(DEFAULT_QUEUE_SETTINGS).toEqual({
+      noShowGracePatients: 2,
+      noShowGraceMinutes: 15,
+      lateReinsertAfter: 3,
+      staleThresholdMinutes: 10,
+    });
+  });
+});
+
+describe('calling the next patient', () => {
+  it('refuses before the doctor has arrived, and says why', () => {
+    const { state } = session();
+    const result = canCallNext(state);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('SESSION_NOT_RUNNING');
+    expect(result.detail).toContain('arrived');
+  });
+
+  it('allows the call once the doctor is in', () => {
+    const { state } = running();
+    expect(canCallNext(state).ok).toBe(true);
+    expect(nextToCall(state)?.serial).toBe(1);
+  });
+
+  it('refuses while a patient is still in the chamber, naming the serial', () => {
+    const { state, log } = running();
+    const occupied = reduce(
+      state,
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    );
+
+    const result = canCallNext(occupied);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // The console's answer to this is to relabel the button and do both
+    // actions (APP_FLOW.md B1.3), so the code has to be distinguishable.
+    expect(result.code).toBe('PATIENT_IN_CHAMBER');
+    expect(result.detail).toContain('1');
+  });
+
+  it('refuses while the session is paused', () => {
+    const { state, log } = running();
+    const paused = reduce(state, log.next('SESSION_PAUSED', { reason: 'prayer' }));
+
+    const result = canCallNext(paused);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('SESSION_NOT_RUNNING');
+  });
+
+  it('refuses when nobody is waiting', () => {
+    const { state, log } = running(1);
+    const finished = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+    ]);
+
+    const result = canCallNext(finished);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('QUEUE_EMPTY');
+  });
+
+  it('refuses after the session has ended', () => {
+    const { state, log } = running();
+    const ended = reduce(state, log.next('SESSION_ENDED', { reason: null }));
+
+    const result = canCallNext(ended);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('SESSION_ENDED');
+  });
+});
+
+describe('ending a chamber (BTN-B02-END)', () => {
+  it('refuses while a patient is in the chamber, naming the serial', () => {
+    const { state, log } = running();
+    const occupied = reduce(
+      state,
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    );
+
+    // An ended session takes no further action: ended now, serial 1 would be
+    // "in the chamber" for good.
+    const result = canEndSession(occupied);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('PATIENT_IN_CHAMBER');
+    expect(result.detail).toContain('1');
+  });
+
+  it('allows it once that patient has been finished', () => {
+    const { state, log } = running();
+    const finished = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+    ]);
+
+    expect(canEndSession(finished).ok).toBe(true);
+  });
+
+  it('is not refused by patients who are only waiting, and counts them', () => {
+    const { state, log } = running(5);
+    const midway = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+      log.next('PATIENT_LATE', { bookingId: bookingId(2), expectedMinutes: 20, reinsertAfter: 3 }),
+    ]);
+
+    // Four people have not been seen, one of them late. That is for the
+    // person at the counter to be told and to decide — not for this guard.
+    expect(canEndSession(midway).ok).toBe(true);
+    expect(unseenAtEnd(midway)).toBe(4);
+  });
+
+  it('changes nobody: the patients left waiting are still waiting after the end', () => {
+    const { state, log } = running(3);
+    const before = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+    ]);
+    const ended = reduce(before, log.next('SESSION_ENDED', { reason: null }));
+
+    expect(ended.status).toBe('ended');
+    expect(ended.entries.map((entry) => entry.status)).toEqual(
+      before.entries.map((entry) => entry.status),
+    );
+    expect(unseenAtEnd(ended)).toBe(2);
+  });
+
+  it('allows a chamber nobody was ever called in to be ended', () => {
+    const { state } = session();
+    expect(canEndSession(state).ok).toBe(true);
+  });
+
+  it('refuses a chamber that has already ended', () => {
+    const { state, log } = running();
+    const ended = reduce(state, log.next('SESSION_ENDED', { reason: null }));
+
+    const result = canEndSession(ended);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('SESSION_ENDED');
+  });
+});
+
+describe('marking a patient done', () => {
+  it('allows it for the patient in the chamber', () => {
+    const { state, log } = running();
+    const occupied = reduce(
+      state,
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    );
+
+    expect(canMarkDone(occupied, bookingId(1)).ok).toBe(true);
+  });
+
+  it('refuses for a patient who was never called', () => {
+    const { state } = running();
+    const result = canMarkDone(state, bookingId(2));
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('BOOKING_SETTLED');
+  });
+
+  it('refuses for a booking in another session', () => {
+    const { state } = running();
+    const result = canMarkDone(state, bookingId(999));
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('UNKNOWN_BOOKING');
+  });
+});
+
+describe('the no-show grace period (FR-QUE-20)', () => {
+  /** A session where one patient has been seen, so the next is at the front. */
+  function atFront(consultSeconds: number): QueueState {
+    const { state, log } = running();
+    return fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(consultSeconds).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds }),
+    ]);
+  }
+
+  it('refuses the moment a turn arrives', () => {
+    const state = atFront(300);
+    const result = canMarkNoShow(
+      state,
+      bookingId(2),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T11:05:00.000Z'),
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('NO_SHOW_BEFORE_GRACE');
+  });
+
+  it('gives a fast chamber the fifteen-minute floor, not two quick slots', () => {
+    // Five minutes a patient: two patients' time is ten minutes, so the floor
+    // governs and the patient still gets fifteen.
+    const state = atFront(300);
+    expect(graceWindowMinutes(state, DEFAULT_QUEUE_SETTINGS)).toBe(15);
+
+    // Turn arrived at 11:05.
+    const tenMinutesLater = timestamp('2026-09-17T11:15:00.000Z');
+    const sixteenMinutesLater = timestamp('2026-09-17T11:21:00.000Z');
+
+    expect(canMarkNoShow(state, bookingId(2), DEFAULT_QUEUE_SETTINGS, tenMinutesLater).ok).toBe(
+      false,
+    );
+    expect(canMarkNoShow(state, bookingId(2), DEFAULT_QUEUE_SETTINGS, sixteenMinutesLater).ok).toBe(
+      true,
+    );
+  });
+
+  it('gives a slow chamber the longer window, because two slots really are longer', () => {
+    // Twelve minutes a patient: two patients' time is twenty-four minutes.
+    const state = atFront(720);
+    expect(graceWindowMinutes(state, DEFAULT_QUEUE_SETTINGS)).toBe(24);
+
+    // Turn arrived at 11:12.
+    const twentyMinutesLater = timestamp('2026-09-17T11:32:00.000Z');
+    const twentyFiveMinutesLater = timestamp('2026-09-17T11:37:00.000Z');
+
+    expect(canMarkNoShow(state, bookingId(2), DEFAULT_QUEUE_SETTINGS, twentyMinutesLater).ok).toBe(
+      false,
+    );
+    expect(
+      canMarkNoShow(state, bookingId(2), DEFAULT_QUEUE_SETTINGS, twentyFiveMinutesLater).ok,
+    ).toBe(true);
+  });
+
+  it('runs the clock from the turn, never from the planned start', () => {
+    const state = atFront(300);
+    const grace = graceRemaining(
+      state,
+      bookingId(2),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T11:09:00.000Z'),
+    );
+
+    // The previous consultation ended at 11:05, which is when this patient
+    // reached the front — not 11:00 when the session was due to start.
+    expect(grace?.turnReachedAt).toBe(timestamp('2026-09-17T11:05:00.000Z'));
+    expect(grace?.minutesRemaining).toBe(11);
+    expect(grace?.windowMinutes).toBe(15);
+  });
+
+  it('never deadlocks the counter, whatever the queue does', () => {
+    // The interpretation that counts calls instead of time would hang here:
+    // the absent patient is at the front, so no further call can happen, so a
+    // call-counting threshold would never be reached and the receptionist
+    // could never move on (PRD.md §3.4).
+    const state = atFront(300);
+    const muchLater = timestamp('2026-09-17T13:00:00.000Z');
+
+    expect(canMarkNoShow(state, bookingId(2), DEFAULT_QUEUE_SETTINGS, muchLater).ok).toBe(true);
+  });
+
+  it('refuses for a patient whose turn has not come round', () => {
+    const { state } = running();
+    const result = canMarkNoShow(
+      state,
+      bookingId(5),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T13:00:00.000Z'),
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('NOT_A_NO_SHOW');
+  });
+
+  it('honours a hospital that has configured a shorter grace', () => {
+    const state = atFront(300);
+    const lenient = { ...DEFAULT_QUEUE_SETTINGS, noShowGracePatients: 1, noShowGraceMinutes: 2 };
+
+    expect(graceWindowMinutes(state, lenient)).toBe(5);
+    expect(
+      canMarkNoShow(state, bookingId(2), lenient, timestamp('2026-09-17T11:11:00.000Z')).ok,
+    ).toBe(true);
+  });
+
+  it('never lets a patient be marked absent before the time they were told (FR-QUE-11)', () => {
+    // The handover's session: thirty minutes declared before the doctor came,
+    // the doctor in at 11:32, three patients seen by 11:50.
+    const { state, log } = session(6);
+    const arrivedAt = timestamp('2026-09-17T11:32:00.000Z');
+    const seen = fold(state, [
+      log.next('DELAY_DECLARED', { minutes: 30, reason: 'traffic', declaredBy: 'reception' }),
+      log.advance(1920).next('DOCTOR_ARRIVED', { arrivedAt, minutesLate: 32 }),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(360).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 360 }),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(2), serial: serial(2) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(2), consultSeconds: 300 }),
+      log.next('PATIENT_CALLED', { bookingId: bookingId(3), serial: serial(3) }),
+      log.advance(420).next('PATIENT_DONE', { bookingId: bookingId(3), consultSeconds: 420 }),
+    ]);
+
+    // 11:50, chamber empty, serial 4 at the front.
+    const turn = timestamp('2026-09-17T11:50:00.000Z');
+    const told = etaFor(seen, bookingId(4), turn)?.etaAt ?? null;
+    expect(told).toBe(turn);
+
+    const grace = graceRemaining(seen, bookingId(4), DEFAULT_QUEUE_SETTINGS, turn);
+    expect(grace?.turnReachedAt).toBe(turn);
+
+    // Absent-marking opens a full grace window after the time on the phone,
+    // not fourteen minutes before it.
+    const sixteenLater = timestamp('2026-09-17T12:06:00.000Z');
+    expect(canMarkNoShow(seen, bookingId(4), DEFAULT_QUEUE_SETTINGS, sixteenLater).ok).toBe(true);
+    expect(told !== null && told < sixteenLater).toBe(true);
+  });
+
+  it('does not run out while the doctor is called away (FR-REC-03)', () => {
+    // Serial 1 seen by 11:05; at 11:06 the doctor is called away for half an
+    // hour. Serial 2 is at the front and is told 11:36.
+    const { state, log } = running();
+    const held = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+      log
+        .advance(60)
+        .next('DELAY_DECLARED', { minutes: 30, reason: 'emergency', declaredBy: 'reception' }),
+    ]);
+    const heldUntil = timestamp('2026-09-17T11:36:00.000Z');
+    expect(etaFor(held, bookingId(2), timestamp('2026-09-17T11:10:00.000Z'))?.etaAt).toBe(
+      heldUntil,
+    );
+
+    // Twenty-five minutes after the turn came round, which would be past the
+    // grace if the hold did not count.
+    const duringHold = canMarkNoShow(
+      held,
+      bookingId(2),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T11:30:00.000Z'),
+    );
+    expect(duringHold.ok).toBe(false);
+
+    const graceAfterHold = graceRemaining(
+      held,
+      bookingId(2),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T11:40:00.000Z'),
+    );
+    expect(graceAfterHold?.turnReachedAt).toBe(heldUntil);
+    expect(graceAfterHold?.minutesRemaining).toBe(11);
+
+    expect(
+      canMarkNoShow(
+        held,
+        bookingId(2),
+        DEFAULT_QUEUE_SETTINGS,
+        timestamp('2026-09-17T11:52:00.000Z'),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it('does not run during a break, and starts again when the chamber does (FR-REC-05)', () => {
+    // Serial 1 seen by 11:05, a prayer break from 11:06 to 11:30. Serial 2 is
+    // at the front throughout and could not have been called for any of it.
+    const { state, log } = running();
+    const paused = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+      log.advance(60).next('SESSION_PAUSED', { reason: 'prayer' }),
+    ]);
+
+    const duringBreak = canMarkNoShow(
+      paused,
+      bookingId(2),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T11:25:00.000Z'),
+    );
+    expect(duringBreak.ok).toBe(false);
+    if (duringBreak.ok) return;
+    expect(duringBreak.code).toBe('SESSION_NOT_RUNNING');
+
+    const resumed = reduce(paused, log.advance(1440).next('SESSION_RESUMED', {}));
+    const resumedAt = timestamp('2026-09-17T11:30:00.000Z');
+
+    // A minute after the break, twenty-six after the turn first came round.
+    const justAfter = canMarkNoShow(
+      resumed,
+      bookingId(2),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T11:31:00.000Z'),
+    );
+    expect(justAfter.ok).toBe(false);
+    if (justAfter.ok) return;
+    expect(justAfter.code).toBe('NO_SHOW_BEFORE_GRACE');
+    expect(
+      graceRemaining(resumed, bookingId(2), DEFAULT_QUEUE_SETTINGS, resumedAt)?.turnReachedAt,
+    ).toBe(resumedAt);
+
+    expect(
+      canMarkNoShow(
+        resumed,
+        bookingId(2),
+        DEFAULT_QUEUE_SETTINGS,
+        timestamp('2026-09-17T11:46:00.000Z'),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it('refuses to mark the same patient absent twice', () => {
+    const { state, log } = running();
+    const absent = reduce(
+      state,
+      log.next('PATIENT_NO_SHOW', { bookingId: bookingId(1), graceUsedMinutes: 20 }),
+    );
+
+    const result = canMarkNoShow(
+      absent,
+      bookingId(1),
+      DEFAULT_QUEUE_SETTINGS,
+      timestamp('2026-09-17T12:00:00.000Z'),
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('BOOKING_SETTLED');
+  });
+});
+
+describe('reinstating a patient (FR-QUE-22)', () => {
+  it('allows a no-show back into the queue', () => {
+    const { state, log } = running();
+    const absent = reduce(
+      state,
+      log.next('PATIENT_NO_SHOW', { bookingId: bookingId(1), graceUsedMinutes: 20 }),
+    );
+
+    expect(canReinstate(absent, bookingId(1)).ok).toBe(true);
+  });
+
+  it('refuses for a patient who was already seen', () => {
+    const { state, log } = running();
+    const seen = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.advance(300).next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+    ]);
+
+    const result = canReinstate(seen, bookingId(1));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('NOT_A_NO_SHOW');
+  });
+});
+
+describe('checking a patient in (FR-REC-18)', () => {
+  function refusal(result: ReturnType<typeof canCheckIn>): string | null {
+    return result.ok ? null : result.code;
+  }
+
+  it('allows a booked patient, before and after the doctor arrives', () => {
+    expect(canCheckIn(session().state, bookingId(2), 25).ok).toBe(true);
+    expect(canCheckIn(running().state, bookingId(2), 25).ok).toBe(true);
+  });
+
+  it('allows a patient who declared lateness and has now turned up', () => {
+    const { state, log } = running();
+    const late = reduce(
+      state,
+      log.next('PATIENT_LATE', { bookingId: bookingId(1), expectedMinutes: 20, reinsertAfter: 3 }),
+    );
+
+    expect(canCheckIn(late, bookingId(1), 10).ok).toBe(true);
+  });
+
+  it('refuses a second check-in, which would move the measured arrival', () => {
+    const { state, log } = running();
+    const here = reduce(
+      state,
+      log.next('PATIENT_ARRIVED', { bookingId: bookingId(2), quotedWaitMinutes: 20 }),
+    );
+
+    expect(refusal(canCheckIn(here, bookingId(2), 20))).toBe('ALREADY_ARRIVED');
+  });
+
+  it('refuses somebody already in the chamber, and anybody settled', () => {
+    const { state, log } = running();
+    const next = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.next('PATIENT_NO_SHOW', { bookingId: bookingId(2), graceUsedMinutes: 20 }),
+    ]);
+
+    expect(refusal(canCheckIn(next, bookingId(1), 0))).toBe('ALREADY_ARRIVED');
+    // A no-show who turns up is reinstated first — a different decision.
+    expect(refusal(canCheckIn(next, bookingId(2), 10))).toBe('BOOKING_SETTLED');
+  });
+
+  it('refuses a quote that is not a plausible number of minutes', () => {
+    const { state } = running();
+
+    expect(refusal(canCheckIn(state, bookingId(2), -5))).toBe('QUOTE_OUT_OF_RANGE');
+    expect(refusal(canCheckIn(state, bookingId(2), 12.5))).toBe('QUOTE_OUT_OF_RANGE');
+    expect(refusal(canCheckIn(state, bookingId(2), MAX_QUOTED_WAIT_MINUTES + 1))).toBe(
+      'QUOTE_OUT_OF_RANGE',
+    );
+    expect(canCheckIn(state, bookingId(2), MAX_QUOTED_WAIT_MINUTES).ok).toBe(true);
+  });
+
+  it('refuses an unknown booking and an ended session', () => {
+    const { state, log } = running();
+
+    expect(refusal(canCheckIn(state, bookingId(99), 10))).toBe('UNKNOWN_BOOKING');
+
+    const ended = reduce(state, log.next('SESSION_ENDED', { reason: null }));
+    expect(refusal(canCheckIn(ended, bookingId(2), 10))).toBe('SESSION_ENDED');
+  });
+});
+
+describe('a patient declaring lateness (FR-PAT-33)', () => {
+  it('is allowed while they are still waiting', () => {
+    const { state } = running();
+    expect(canDeclareLate(state, bookingId(3)).ok).toBe(true);
+  });
+
+  it('is refused once they are in the chamber', () => {
+    const { state, log } = running();
+    const called = reduce(
+      state,
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    );
+
+    const result = canDeclareLate(called, bookingId(1));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('PATIENT_IN_CHAMBER');
+  });
+
+  it('is refused after the session has ended', () => {
+    const { state, log } = running();
+    const ended = reduce(state, log.next('SESSION_ENDED', { reason: null }));
+
+    const result = canDeclareLate(ended, bookingId(2));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('SESSION_ENDED');
+  });
+});
+
+describe('reordering for priority (FR-REC-15)', () => {
+  it('requires a reason, because it goes into the audit log', () => {
+    const { state } = running();
+
+    const blank = canReorder(state, bookingId(3), '   ');
+    expect(blank.ok).toBe(false);
+    if (blank.ok) return;
+    expect(blank.code).toBe('REASON_REQUIRED');
+
+    expect(canReorder(state, bookingId(3), 'elderly').ok).toBe(true);
+  });
+});
+
+describe('walk-ins (FR-REC-14)', () => {
+  it('needs no reason to be added at the end', () => {
+    const { state } = running();
+    expect(canAddWalkin(state, 'end', null).ok).toBe(true);
+  });
+
+  it('needs a reason to jump ahead of waiting patients', () => {
+    const { state } = running();
+
+    const result = canAddWalkin(state, 'index', null);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('REASON_REQUIRED');
+
+    expect(canAddWalkin(state, 'index', 'referred by the ER').ok).toBe(true);
+  });
+});
+
+describe('session controls', () => {
+  it('allows the doctor to be marked arrived exactly once', () => {
+    const { state, log } = session();
+    expect(canDeclareDoctorArrived(state).ok).toBe(true);
+
+    const arrived = reduce(
+      state,
+      log.next('DOCTOR_ARRIVED', { arrivedAt: PLANNED_START, minutesLate: 0 }),
+    );
+
+    const result = canDeclareDoctorArrived(arrived);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('DOCTOR_ALREADY_ARRIVED');
+  });
+
+  it('accepts the delay durations the console offers, and rejects nonsense', () => {
+    const { state } = running();
+
+    for (const minutes of [15, 30, 45, 60]) {
+      expect(canDeclareDelay(state, minutes).ok, `${String(minutes)} minutes`).toBe(true);
+    }
+
+    for (const minutes of [0, -30, 1.5, MAX_DELAY_MINUTES + 1]) {
+      const result = canDeclareDelay(state, minutes);
+      expect(result.ok, `${String(minutes)} minutes`).toBe(false);
+      if (result.ok) continue;
+      expect(result.code).toBe('DELAY_OUT_OF_RANGE');
+    }
+  });
+
+  it('pauses and resumes in the right order', () => {
+    const { state, log } = running();
+
+    expect(canResume(state).ok).toBe(false);
+    expect(canPause(state).ok).toBe(true);
+
+    const paused = reduce(state, log.next('SESSION_PAUSED', { reason: 'prayer' }));
+
+    expect(canPause(paused).ok).toBe(false);
+    expect(canResume(paused).ok).toBe(true);
+  });
+});
+
+describe('what a console may replay (BACKEND.md §5)', () => {
+  /** Event types with a route of their own, which a batch must not carry. */
+  const OWN_ROUTE = [
+    'SESSION_OPENED',
+    'SESSION_ENDED',
+    'WALKIN_ADDED',
+    'BOOKING_CANCELLED',
+    'SLOT_OFFERED',
+    'SLOT_ACCEPTED',
+    'SLOT_EXPIRED',
+    'ACTION_UNDONE',
+  ] as const;
+
+  it('decides every event type one way or the other', () => {
+    // A type added to `queue_event_type` lands in neither list, and this is
+    // where that shows: whether a console may replay it is a decision, not a
+    // default.
+    const decided = [...Object.keys(OFFLINE_ACTION_ROLES), ...OWN_ROUTE].sort();
+    expect(decided).toEqual([...QUEUE_EVENT_TYPES].sort());
+  });
+
+  it('refuses the types that have a route of their own, whoever asks', () => {
+    for (const type of OWN_ROUTE) {
+      const result = canReplayOffline(type, ['receptionist', 'doctor', 'hospital_admin']);
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      expect(result.code).toBe('NOT_AN_OFFLINE_ACTION');
+    }
+  });
+
+  it('lets the counter replay everything it can do offline', () => {
+    for (const type of Object.keys(OFFLINE_ACTION_ROLES) as OfflineAction[]) {
+      expect(canReplayOffline(type, ['receptionist']).ok).toBe(true);
+    }
+  });
+
+  it('holds a doctor to the chamber, and an administrator to reading', () => {
+    expect(canReplayOffline('DELAY_DECLARED', ['doctor']).ok).toBe(true);
+    expect(canReplayOffline('PATIENT_DONE', ['doctor']).ok).toBe(true);
+
+    const noShow = canReplayOffline('PATIENT_NO_SHOW', ['doctor']);
+    expect(noShow.ok).toBe(false);
+    if (!noShow.ok) expect(noShow.code).toBe('ROLE_NOT_ALLOWED');
+
+    expect(canReplayOffline('PATIENT_CALLED', ['hospital_admin']).ok).toBe(false);
+    // Any one of several roles is enough (`FR-ROLE-02`).
+    expect(canReplayOffline('PATIENT_NO_SHOW', ['doctor', 'receptionist']).ok).toBe(true);
+  });
+});
+
+describe('capacity', () => {
+  it('counts a cancellation as a freed place, which is what makes recovery possible', () => {
+    const seed = makeSeed(3);
+    const capped = { plan: { ...seed.plan, capacity: 3 }, roster: seed.roster };
+    const state = emptyState(capped);
+    const log = new LogBuilder(capped.plan.sessionId);
+
+    expect(hasCapacity(state)).toBe(false);
+
+    const freed = reduce(
+      state,
+      log.next('BOOKING_CANCELLED', { bookingId: bookingId(2), reason: 'cancelled' }),
+    );
+
+    expect(hasCapacity(freed)).toBe(true);
+  });
+
+  it('is always available when a session has no cap', () => {
+    const seed = makeSeed(3);
+    const uncapped = { plan: { ...seed.plan, capacity: null }, roster: seed.roster };
+
+    expect(hasCapacity(emptyState(uncapped))).toBe(true);
+  });
+});
+
+/** Somebody on the standby list — a patient, not a booking: they have none. */
+const STANDBY_PATIENT = id<PatientId>('44444444-4444-7444-8444-000000000009');
+
+describe('offering a chair somebody freed (FR-QUE-30)', () => {
+  const OFFER_ID = id<SlotOfferId>('55555555-5555-7555-8555-000000000001');
+  /** A running session with serial 2 marked no-show, so a chair is free. */
+  function withFreedChair(): { state: QueueState; log: LogBuilder; freed: BookingId } {
+    const { state, log } = running();
+    const freed = bookingId(2);
+    const after = fold(state, [
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+      log.next('PATIENT_DONE', { bookingId: bookingId(1), consultSeconds: 300 }),
+      log.next('PATIENT_CALLED', { bookingId: freed, serial: serial(2) }),
+      log.next('PATIENT_NO_SHOW', { bookingId: freed, graceUsedMinutes: 20 }),
+    ]);
+    return { state: after, log, freed };
+  }
+
+  it('offers a chair a no-show left empty', () => {
+    const { state, freed } = withFreedChair();
+    expect(canOfferFreedSlot(state, freed)).toEqual({ ok: true });
+  });
+
+  it('offers a chair a cancellation left empty', () => {
+    const { state, log } = running();
+    const cancelled = bookingId(4);
+    const after = reduce(
+      state,
+      log.next('BOOKING_CANCELLED', { bookingId: cancelled, reason: 'patient cancelled' }),
+    );
+
+    expect(canOfferFreedSlot(after, cancelled)).toEqual({ ok: true });
+  });
+
+  it('refuses to give away the chair of somebody merely late', () => {
+    // FR-QUE-21: a late patient still holds their place. Offering it would
+    // take a turn from a person standing outside the door in traffic.
+    const { state, log } = running();
+    const late = bookingId(3);
+    const after = reduce(
+      state,
+      log.next('PATIENT_LATE', { bookingId: late, expectedMinutes: 20, reinsertAfter: 3 }),
+    );
+
+    expect(canOfferFreedSlot(after, late)).toMatchObject({ ok: false, code: 'SLOT_NOT_FREE' });
+  });
+
+  it('refuses a chair somebody is still waiting in', () => {
+    const { state } = running();
+    expect(canOfferFreedSlot(state, bookingId(3))).toMatchObject({
+      ok: false,
+      code: 'SLOT_NOT_FREE',
+    });
+  });
+
+  it('refuses a booking that is not in this session', () => {
+    const { state } = running();
+    expect(canOfferFreedSlot(state, bookingId(99))).toMatchObject({
+      ok: false,
+      code: 'UNKNOWN_BOOKING',
+    });
+  });
+
+  it('refuses a second offer against the same chair', () => {
+    // Two outstanding offers for one place is two people told to come in, and
+    // the second to arrive is turned away at the counter.
+    const { state, log, freed } = withFreedChair();
+    const offered = reduce(
+      state,
+      log.next('SLOT_OFFERED', {
+        offerId: OFFER_ID,
+        freedBookingId: freed,
+        offeredTo: [STANDBY_PATIENT],
+        expiresAt: timestamp('2026-09-17T12:10:00.000Z'),
+      }),
+    );
+
+    expect(canOfferFreedSlot(offered, freed)).toMatchObject({
+      ok: false,
+      code: 'OFFER_OUTSTANDING',
+    });
+  });
+
+  it('allows the chair to be offered again once the first offer lapsed', () => {
+    // "Unaccepted offers pass to the next patient" — which is only possible if
+    // an expired offer stops blocking the chair.
+    const { state, log, freed } = withFreedChair();
+    const lapsed = fold(state, [
+      log.next('SLOT_OFFERED', {
+        offerId: OFFER_ID,
+        freedBookingId: freed,
+        offeredTo: [STANDBY_PATIENT],
+        expiresAt: timestamp('2026-09-17T12:10:00.000Z'),
+      }),
+      log.next('SLOT_EXPIRED', { offerId: OFFER_ID }),
+    ]);
+
+    expect(canOfferFreedSlot(lapsed, freed)).toEqual({ ok: true });
+  });
+
+  it('refuses to offer anything once the session has ended', () => {
+    const { state, log, freed } = withFreedChair();
+    const ended = reduce(state, log.next('SESSION_ENDED', { reason: null }));
+
+    expect(canOfferFreedSlot(ended, freed)).toMatchObject({ ok: false, code: 'SESSION_ENDED' });
+  });
+});
+
+describe('accepting an offered chair', () => {
+  const OFFER_ID = id<SlotOfferId>('55555555-5555-7555-8555-000000000002');
+  const EXPIRES = timestamp('2026-09-17T12:10:00.000Z');
+
+  function offered(): { state: QueueState; log: LogBuilder } {
+    const { state, log } = running();
+    const freed = bookingId(2);
+    const after = fold(state, [
+      log.next('BOOKING_CANCELLED', { bookingId: freed, reason: 'patient cancelled' }),
+      log.next('SLOT_OFFERED', {
+        offerId: OFFER_ID,
+        freedBookingId: freed,
+        offeredTo: [STANDBY_PATIENT],
+        expiresAt: EXPIRES,
+      }),
+    ]);
+    return { state: after, log };
+  }
+
+  it('accepts inside the window', () => {
+    const { state } = offered();
+    expect(canAcceptSlot(state, OFFER_ID, timestamp('2026-09-17T12:05:00.000Z'))).toEqual({
+      ok: true,
+    });
+  });
+
+  it('refuses once the clock has passed the deadline, with nothing having swept it', () => {
+    // Nothing runs on a timer in this version, so an offer that lapsed twenty
+    // minutes ago is still `pending` in the log. It must not be acceptable
+    // merely because no worker has said otherwise yet.
+    const { state } = offered();
+    expect(canAcceptSlot(state, OFFER_ID, timestamp('2026-09-17T12:30:00.000Z'))).toMatchObject({
+      ok: false,
+      code: 'OFFER_EXPIRED',
+    });
+  });
+
+  it('refuses at the deadline exactly', () => {
+    const { state } = offered();
+    expect(canAcceptSlot(state, OFFER_ID, EXPIRES)).toMatchObject({
+      ok: false,
+      code: 'OFFER_EXPIRED',
+    });
+  });
+
+  it('refuses a chair already taken', () => {
+    const { state, log } = offered();
+    const taken = reduce(
+      state,
+      log.next('SLOT_ACCEPTED', { offerId: OFFER_ID, newBookingId: bookingId(9) }),
+    );
+
+    expect(canAcceptSlot(taken, OFFER_ID, timestamp('2026-09-17T12:05:00.000Z'))).toMatchObject({
+      ok: false,
+      code: 'OFFER_SETTLED',
+    });
+  });
+
+  it('refuses an offer that does not exist', () => {
+    const { state } = offered();
+    expect(
+      canAcceptSlot(state, 'not-an-offer', timestamp('2026-09-17T12:05:00.000Z')),
+    ).toMatchObject({ ok: false, code: 'UNKNOWN_OFFER' });
+  });
+
+  it('names the offers whose window has closed', () => {
+    const { state } = offered();
+
+    expect(lapsedOffers(state, timestamp('2026-09-17T12:05:00.000Z'))).toHaveLength(0);
+    expect(lapsedOffers(state, timestamp('2026-09-17T12:30:00.000Z'))).toHaveLength(1);
+  });
+});
+
+describe('the quote a check-in starts from (FR-REC-18)', () => {
+  it('is the minutes to the estimated call, in round fives', () => {
+    const { state } = running(6);
+    const now = timestamp('2026-09-17T11:00:00.000Z');
+
+    const quotes = [1, 2, 3, 4].map((serialNumber) =>
+      suggestedQuote(state, bookingId(serialNumber), now),
+    );
+
+    for (const quote of quotes) {
+      expect(quote).not.toBeNull();
+      expect((quote ?? 1) % QUOTE_STEP_MINUTES).toBe(0);
+    }
+    // Further back in the line is a longer wait, never a shorter one.
+    expect(quotes).toEqual([...quotes].sort((a, b) => (a ?? 0) - (b ?? 0)));
+    expect(quotes[3]).toBeGreaterThan(quotes[0] ?? 0);
+  });
+
+  it('has no suggestion for somebody in the chamber, or not in the session', () => {
+    const { state, log } = running(3);
+    const now = timestamp('2026-09-17T11:05:00.000Z');
+    const calling = reduce(
+      state,
+      log.next('PATIENT_CALLED', { bookingId: bookingId(1), serial: serial(1) }),
+    );
+
+    expect(suggestedQuote(calling, bookingId(1), now)).toBeNull();
+    expect(suggestedQuote(calling, bookingId(42), now)).toBeNull();
+  });
+
+  it('never suggests more than a quote may say', () => {
+    const { state } = session(3);
+    // A chamber that starts in a fortnight: the estimate is huge, the quote is not.
+    const now = timestamp('2026-09-01T11:00:00.000Z');
+    expect(suggestedQuote(state, bookingId(3), now)).toBe(MAX_QUOTED_WAIT_MINUTES);
+  });
+});

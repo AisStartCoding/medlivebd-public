@@ -1,0 +1,379 @@
+/**
+ * The enums from DATABASE.md §1, as the single definition in the codebase.
+ *
+ * Each one is a frozen tuple of labels plus a union type derived from it, so
+ * the labels are available at runtime (for validation and for `db:verify`) and
+ * as a type (for the reducer's exhaustive switches). `database/scripts/lib/verify.ts`
+ * imports these and asserts the database agrees, which means a label added to
+ * one side and forgotten on the other fails CI instead of reaching a console
+ * as an unhandled case.
+ *
+ * Order matters and is the document's order: PostgreSQL enum sort order is
+ * declaration order, and `ORDER BY status` in a console query depends on it.
+ *
+ * Adding a label: add it here, add `ALTER TYPE ... ADD VALUE` in a new
+ * migration, and handle it wherever the compiler now complains. Never reorder,
+ * never rename.
+ */
+
+export const USER_KINDS = ['patient', 'guest', 'staff', 'platform'] as const;
+export type UserKind = (typeof USER_KINDS)[number];
+
+export const SEXES = ['male', 'female', 'other'] as const;
+export type Sex = (typeof SEXES)[number];
+
+export const STAFF_ROLES = [
+  'receptionist',
+  'doctor',
+  'ward',
+  'emergency',
+  'lab',
+  'pharmacy',
+  'hospital_admin',
+  'platform_admin',
+  'gov_viewer',
+] as const;
+export type StaffRole = (typeof STAFF_ROLES)[number];
+
+export const FACILITY_KINDS = [
+  'hospital',
+  'clinic',
+  'diagnostic',
+  'government',
+  'chamber',
+] as const;
+export type FacilityKind = (typeof FACILITY_KINDS)[number];
+
+/**
+ * The kinds an organisation may apply as by itself (`FR-ONB-09`). Not
+ * `chamber`: a private chamber joins only once the platform has approved it
+ * (`FR-ONB-11`, plan R7, 0062), so only a platform administrator creates one.
+ */
+export const APPLICABLE_FACILITY_KINDS = [
+  'hospital',
+  'clinic',
+  'diagnostic',
+  'government',
+] as const satisfies readonly FacilityKind[];
+
+export const SESSION_STATUSES = ['scheduled', 'running', 'paused', 'ended', 'cancelled'] as const;
+export type SessionStatus = (typeof SESSION_STATUSES)[number];
+
+export const BOOKING_STATUSES = [
+  'booked',
+  'waiting',
+  'in_chamber',
+  'done',
+  'late',
+  'no_show',
+  'cancelled',
+  'rescheduled',
+] as const;
+export type BookingStatus = (typeof BOOKING_STATUSES)[number];
+
+/** 'import' is an appointment brought in from a hospital's own system (0029, FR-IMP-01 set C). */
+export const BOOKING_SOURCES = [
+  'app',
+  'guest_link',
+  'counter',
+  'phone',
+  'walkin',
+  'import',
+] as const;
+export type BookingSource = (typeof BOOKING_SOURCES)[number];
+
+/**
+ * The 19 facts that can be true about a session (FR-QUE-03).
+ *
+ * The queue is derived from these and nothing else (DB-P1). Every switch over
+ * this union is checked for exhaustiveness by lint, so a new event type cannot
+ * be added without the reducer being forced to decide what it means.
+ */
+export const QUEUE_EVENT_TYPES = [
+  'SESSION_OPENED',
+  'DOCTOR_ARRIVED',
+  'DELAY_DECLARED',
+  'SESSION_PAUSED',
+  'SESSION_RESUMED',
+  'PATIENT_CALLED',
+  'PATIENT_DONE',
+  'PATIENT_LATE',
+  'PATIENT_NO_SHOW',
+  'PATIENT_REINSERTED',
+  'PATIENT_ARRIVED',
+  'WALKIN_ADDED',
+  'BOOKING_CANCELLED',
+  'SLOT_OFFERED',
+  'SLOT_ACCEPTED',
+  'SLOT_EXPIRED',
+  'PRIORITY_REORDERED',
+  'SESSION_ENDED',
+  'ACTION_UNDONE',
+] as const;
+export type QueueEventType = (typeof QUEUE_EVENT_TYPES)[number];
+
+export const BED_KINDS = [
+  'general',
+  'cabin',
+  'hdu',
+  'icu',
+  'ccu',
+  'nicu',
+  'isolation',
+  'burn',
+] as const;
+export type BedKind = (typeof BED_KINDS)[number];
+
+export const BED_STATES = ['free', 'occupied', 'cleaning', 'reserved', 'out_of_service'] as const;
+export type BedState = (typeof BED_STATES)[number];
+
+export const TRIAGE_COLORS = ['red', 'yellow', 'green'] as const;
+export type TriageColor = (typeof TRIAGE_COLORS)[number];
+
+export const EMERGENCY_STATES = [
+  'inbound',
+  'acknowledged',
+  'arrived',
+  'in_treatment',
+  'admitted',
+  'discharged',
+  'referred',
+  // Migration 0016: the ER said no, and said why (`FR-EMG-02`). Not
+  // `cancelled`, which is the family turning back — a different fact, and one
+  // the family is told differently.
+  'declined',
+  'cancelled',
+] as const;
+export type EmergencyState = (typeof EMERGENCY_STATES)[number];
+
+/**
+ * `FR-PAT-42`'s problem types, in the order `CHIP-A10-<type>` lists them.
+ *
+ * A `text` column with a CHECK (`emergency_cases_problem_allowed`, migration
+ * 0008), not a PostgreSQL enum — so it is deliberately absent from
+ * `DATABASE_ENUMS` below, like `LOCALES`.
+ */
+export const EMERGENCY_PROBLEMS = [
+  'burn',
+  'accident',
+  'cardiac',
+  'stroke',
+  'breathing',
+  'child',
+  'obstetric',
+  'other',
+] as const;
+export type EmergencyProblem = (typeof EMERGENCY_PROBLEMS)[number];
+
+export const REFERRAL_STATES = [
+  'sent',
+  'seen',
+  'accepted',
+  'declined',
+  'arrived',
+  'cancelled',
+] as const;
+export type ReferralState = (typeof REFERRAL_STATES)[number];
+
+export const TEST_STATES = [
+  'ordered',
+  'sample_collected',
+  'processing',
+  'report_ready',
+  'delivered',
+  'cancelled',
+] as const;
+export type TestState = (typeof TEST_STATES)[number];
+
+/**
+ * Ancillary services (migration 0011, DATABASE.md §2.8).
+ *
+ * `ambulance_kind` and `blood_group` are the parenthesised lists in the
+ * document; `ambulance_state` and `blood_request_state` are named there as
+ * `state` with no list, and are the lifecycles `S-A-16` and `S-A-17` describe.
+ * A blood request's urgency reuses `TRIAGE_COLORS` rather than inventing a
+ * fourth vocabulary for the same idea.
+ */
+export const AMBULANCE_KINDS = ['basic', 'als', 'freezer'] as const;
+export type AmbulanceKind = (typeof AMBULANCE_KINDS)[number];
+
+export const AMBULANCE_STATES = [
+  'requested',
+  'quoted',
+  'dispatched',
+  'arrived',
+  'completed',
+  'cancelled',
+] as const;
+export type AmbulanceState = (typeof AMBULANCE_STATES)[number];
+
+export const BLOOD_GROUPS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'] as const;
+export type BloodGroup = (typeof BLOOD_GROUPS)[number];
+
+export const BLOOD_REQUEST_STATES = ['open', 'matched', 'fulfilled', 'cancelled'] as const;
+export type BloodRequestState = (typeof BLOOD_REQUEST_STATES)[number];
+
+export const PAYMENT_METHODS = ['bkash', 'nagad', 'card', 'cash', 'at_hospital'] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+export const PAYMENT_STATES = [
+  'pending',
+  'paid',
+  'failed',
+  'refunded',
+  'partially_refunded',
+] as const;
+export type PaymentState = (typeof PAYMENT_STATES)[number];
+
+export const NOTIF_CHANNELS = ['push', 'sms', 'ivr', 'in_app'] as const;
+export type NotifChannel = (typeof NOTIF_CHANNELS)[number];
+
+export const NOTIF_STATES = ['queued', 'sent', 'delivered', 'failed', 'skipped'] as const;
+export type NotifState = (typeof NOTIF_STATES)[number];
+
+export const CAPABILITY_KINDS = [
+  'burn_unit',
+  'cardiac',
+  'cath_lab',
+  'stroke',
+  'dialysis',
+  'nicu',
+  'trauma_ot',
+  'blood_bank',
+  'ambulance',
+  'isolation',
+] as const;
+export type CapabilityKind = (typeof CAPABILITY_KINDS)[number];
+
+export const CONSENT_SCOPES = ['visit', 'hospital', 'doctor', 'full'] as const;
+export type ConsentScope = (typeof CONSENT_SCOPES)[number];
+
+/**
+ * The public-health tag a doctor may put on a visit (0025, `CHIP-B05-SIGNAL`).
+ *
+ * Exactly the three categories `FR-GOV-03` names, and deliberately not a
+ * diagnosis vocabulary: the free-text diagnosis stays the record, and this is
+ * what a district counts.
+ */
+export const SYMPTOM_SIGNALS = ['dengue', 'diarrhoeal', 'fever'] as const;
+export type SymptomSignal = (typeof SYMPTOM_SIGNALS)[number];
+
+/**
+ * The roles that belong to no facility (`FR-ROLE-01`: R10, R11).
+ *
+ * A `staff_roles` row holding one of these has no hospital, and every other
+ * role must have one (0024, `staff_roles_national_has_no_hospital`).
+ */
+export const NATIONAL_ROLES = [
+  'platform_admin',
+  'gov_viewer',
+] as const satisfies readonly StaffRole[];
+export type NationalRole = (typeof NATIONAL_ROLES)[number];
+
+/**
+ * The roles that cannot sign in without a second factor (pilot step 28,
+ * `FR-SEC-10`): the accounts that create other accounts, reset their
+ * passwords, set fees and see a whole facility's figures. Any other account
+ * may turn it on for itself.
+ */
+export const TWO_FACTOR_REQUIRED_ROLES = [
+  'hospital_admin',
+  'platform_admin',
+] as const satisfies readonly StaffRole[];
+
+/** Locales. bn is the product, en is the toggle (FR-LOC-01, I18N-01). */
+export const LOCALES = ['bn', 'en'] as const;
+export type Locale = (typeof LOCALES)[number];
+
+/**
+ * Every PostgreSQL enum in the schema, keyed by its type name.
+ *
+ * `db:verify` walks this to compare the database against the document. Only
+ * types that exist in the database belong here — `LOCALES` is a `text` column
+ * with a CHECK, not an enum, and is deliberately absent.
+ */
+/** The four sets a hospital's data arrives in (0031, FR-IMP-01); 'records' waits (FR-IMP-12). */
+export const IMPORT_SET_KINDS = ['structure', 'patients', 'appointments', 'records'] as const;
+export type ImportSetKind = (typeof IMPORT_SET_KINDS)[number];
+
+/** An import batch's life (0031, FR-IMP-05..07). */
+export const IMPORT_STATES = ['checked', 'committed', 'undone', 'discarded'] as const;
+export type ImportState = (typeof IMPORT_STATES)[number];
+
+/** What a hospital's own identifier stands for (0030, FR-IMP-04). */
+export const EXTERNAL_KINDS = [
+  'patient',
+  'appointment',
+  'department',
+  'doctor',
+  'schedule',
+  'ward',
+  'bed',
+  'staff',
+] as const;
+export type ExternalKind = (typeof EXTERNAL_KINDS)[number];
+
+/**
+ * A hospital workspace's state (0037, `FR-ONB-02`). The transitions between
+ * them, and who may take each, are `org/lifecycle.ts`.
+ */
+export const ORG_LIFECYCLES = [
+  'setup',
+  'ready_for_review',
+  'active',
+  'suspended',
+  'closed',
+] as const;
+export type OrgLifecycle = (typeof ORG_LIFECYCLES)[number];
+
+/**
+ * Where a hospital's agreement stands (0051, `FR-SUP-04`, plan G1). Set by a
+ * platform administrator and a record only: it has no plan name, no amount,
+ * and gates nothing by itself. Taking a hospital out of the network is
+ * suspending its workspace (`FR-ONB-06`).
+ */
+export const AGREEMENT_STATES = ['trial', 'active', 'overdue', 'ended'] as const;
+export type AgreementState = (typeof AGREEMENT_STATES)[number];
+
+export const DATABASE_ENUMS = {
+  user_kind: USER_KINDS,
+  sex: SEXES,
+  staff_role: STAFF_ROLES,
+  facility_kind: FACILITY_KINDS,
+  session_status: SESSION_STATUSES,
+  booking_status: BOOKING_STATUSES,
+  booking_source: BOOKING_SOURCES,
+  queue_event_type: QUEUE_EVENT_TYPES,
+  bed_kind: BED_KINDS,
+  bed_state: BED_STATES,
+  triage_color: TRIAGE_COLORS,
+  emergency_state: EMERGENCY_STATES,
+  referral_state: REFERRAL_STATES,
+  test_state: TEST_STATES,
+  ambulance_kind: AMBULANCE_KINDS,
+  ambulance_state: AMBULANCE_STATES,
+  blood_group: BLOOD_GROUPS,
+  blood_request_state: BLOOD_REQUEST_STATES,
+  payment_method: PAYMENT_METHODS,
+  payment_state: PAYMENT_STATES,
+  notif_channel: NOTIF_CHANNELS,
+  notif_state: NOTIF_STATES,
+  capability_kind: CAPABILITY_KINDS,
+  consent_scope: CONSENT_SCOPES,
+  symptom_signal: SYMPTOM_SIGNALS,
+  import_set: IMPORT_SET_KINDS,
+  import_state: IMPORT_STATES,
+  external_kind: EXTERNAL_KINDS,
+  org_lifecycle: ORG_LIFECYCLES,
+  agreement_state: AGREEMENT_STATES,
+} as const satisfies Record<string, readonly string[]>;
+
+/** Booking statuses that still occupy a place in the queue. */
+export const ACTIVE_BOOKING_STATUSES = ['booked', 'waiting', 'in_chamber', 'late'] as const;
+
+/** Booking statuses that have left the queue, for better or worse. */
+export const SETTLED_BOOKING_STATUSES = ['done', 'no_show', 'cancelled', 'rescheduled'] as const;
+
+export function isActiveBookingStatus(status: BookingStatus): boolean {
+  return (ACTIVE_BOOKING_STATUSES as readonly BookingStatus[]).includes(status);
+}

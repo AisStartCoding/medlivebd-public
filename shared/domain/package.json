@@ -1,0 +1,25 @@
+{
+  "name": "@platform/domain",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The shared brain: types, queue event log, reducer, ETA maths and validation schemas. No I/O (BACKEND.md §2).",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "compiled": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  }
+}

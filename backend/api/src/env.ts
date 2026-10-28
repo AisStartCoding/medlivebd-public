@@ -1,0 +1,682 @@
+/**
+ * Environment validation (BACKEND.md §10).
+ *
+ * "env.ts validates all of these with zod at boot and refuses to start if any
+ * required key is missing." Refusing to start is the whole point: a service
+ * that boots with a blank `JWT_ACCESS_SECRET` and signs tokens with an empty
+ * string is worse than one that will not boot at all, and a service that comes
+ * up in production with `DEMO_MODE=true` would put demonstration patients in
+ * front of real staff.
+ *
+ * What is required depends on where it is running. In development the Supabase
+ * keys, the SMS credentials and the payment keys are all blank, because the
+ * local stack uses the log provider, the mock payment adapter and the Postgres
+ * container. In production none of them may be.
+ */
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import { z } from 'zod';
+
+import { normaliseBdMobile } from '@platform/domain';
+
+/**
+ * Merges the repository's `.env` into `process.env`, without overwriting
+ * anything already set.
+ *
+ * Skipped in production, where the platform injects real environment
+ * variables and a file on disk would be both absent and the wrong source of
+ * truth. Node 20 can do this with `--env-file`, but that flag *errors* when
+ * the file is missing — which is exactly the situation in CI and in a
+ * container — so the read happens here instead, in nine lines and with no
+ * dependency.
+ *
+ * A real environment variable always wins over the file, which is what lets
+ * the test suite decide its own environment and lets Render override anything.
+ */
+function loadDotEnv(): void {
+  if (process.env['NODE_ENV'] === 'production') return;
+
+  let contents: string;
+  try {
+    contents = readFileSync(resolve(import.meta.dirname, '../../..', '.env'), 'utf8');
+  } catch {
+    return;
+  }
+
+  for (const rawLine of contents.split(new RegExp('\\r?\\n'))) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#')) continue;
+
+    const separator = line.indexOf('=');
+    if (separator === -1) continue;
+
+    const key = line.slice(0, separator).trim();
+    if (key === '' || process.env[key] !== undefined) continue;
+
+    let value = line.slice(separator + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+
+/** Secrets must be long enough that a leaked one is not brute-forceable. */
+const MIN_SECRET_LENGTH = 32;
+
+const secret = z
+  .string()
+  .min(
+    MIN_SECRET_LENGTH,
+    `must be at least ${String(MIN_SECRET_LENGTH)} characters — generate one with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`,
+  );
+
+const duration = z.string().regex(/^\d+[smhd]$/, 'must look like 15m, 24h or 30d');
+
+const boolish = z.enum(['true', 'false']).transform((value) => value === 'true');
+
+/** Whether a connection string names this machine. */
+function onThisMachine(url: string): boolean {
+  try {
+    return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+const port = z.coerce.number().int().min(1).max(65_535);
+const positiveInt = z.coerce.number().int().positive();
+
+/**
+ * An absolute http(s) URL.
+ *
+ * Not `z.url()`, which delegates to the WHATWG parser and therefore accepts
+ * `localhost:4000` — read as protocol `localhost:` with path `4000`. That is a
+ * valid URL and a useless base address, and `WEB_BASE_URL` is what the guest
+ * tracking link is built from (FR-GST-05): get it wrong and every guest
+ * receives an SMS with a link that cannot open.
+ */
+const httpUrl = z.string().refine((value) => {
+  try {
+    const parsed = new URL(value);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname !== '';
+  } catch {
+    return false;
+  }
+}, 'must be an absolute http(s) URL, e.g. https://api.example.com');
+
+/**
+ * An origin exactly as a browser sends it: scheme and host, a port if it is
+ * not the default, and nothing after. One check rather than `httpUrl` and a
+ * second on top, because a value that is not a URL at all must fail as a
+ * setting that is wrong, not as an exception thrown from inside the check.
+ */
+const exactOrigin = z.string().refine((value) => {
+  try {
+    const parsed = new URL(value);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.origin === value;
+  } catch {
+    return false;
+  }
+}, 'must be an origin only, e.g. https://padma.example.com, with no path or trailing slash');
+
+const schema = z.object({
+  // --- Runtime ------------------------------------------------------------
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: port.default(4000),
+  /**
+   * This API's own public address.
+   *
+   * Defaulted rather than required. Nothing reads it — it is here because
+   * BACKEND.md §10 lists it and a deployment will want it for links it does
+   * not yet generate — and a required variable with no consumer is one a
+   * deploy fails on for no benefit anybody can point at.
+   */
+  API_BASE_URL: httpUrl.default('http://localhost:4000'),
+  /** The patient PWA. What a guest tracking link is built from (`FR-GST-05`). */
+  WEB_BASE_URL: httpUrl.default('http://localhost:3000'),
+  /**
+   * The platform's own domain, without a scheme: `medlivebd.example`
+   * (`FR-BRD-07`, plan C2).
+   *
+   * With it, the patient app opened at `<code>.<this domain>` is that
+   * hospital's portal, a hospital's own recorded domain is too, and both are
+   * let through CORS and the socket handshake. Empty, which is the default,
+   * means the deployment has no domain of its own: every address is the
+   * network and a portal is opened with `?scope=`, as before.
+   *
+   * `localhost` is accepted, so a developer's machine and the browser tests
+   * can open `padma.localhost`.
+   */
+  PLATFORM_DOMAIN: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .default('')
+    .refine(
+      (value) =>
+        value === '' ||
+        value === 'localhost' ||
+        /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
+          value,
+        ),
+      'must be a domain name with no scheme or path, e.g. medlivebd.example',
+    ),
+
+  /**
+   * The staff console.
+   *
+   * A separate origin from the patient app, and always has been: they are two
+   * deployments (FRONTEND.md §10). Both have to be allowed through CORS and
+   * through the socket handshake, and a wildcard there would let any page on
+   * the internet open a session channel with a stolen token.
+   */
+  CONSOLE_BASE_URL: httpUrl.default('http://localhost:3100'),
+
+  /**
+   * The platform's share of a booking fee, in integer poisha (`DB-P5`).
+   *
+   * `FR-PAT-21` requires the fee to be shown as a breakdown — consultation,
+   * platform fee, total, and what is due at the hospital — so the code has to
+   * charge and itemise it. What it charges is not a code decision: CLAUDE.md
+   * §1.1 keeps pricing out of this repository entirely, because it is
+   * negotiated per agreement and lives outside it.
+   *
+   * So the itemisation is real and the rate is configuration, defaulting to
+   * zero. A demo therefore shows a breakdown that adds up and claims no price
+   * nobody has agreed to.
+   *
+   * `nonnegative`, not `positive().or(literal(0))`. The union looked
+   * equivalent and was not: an environment variable arrives as a *string*, so
+   * `"0"` coerced to 0 failed `.positive()`, and then `z.literal(0)` was
+   * handed the string `"0"` and failed too, because a literal does not coerce.
+   * The default masked it — the value only parses when it is absent — so
+   * `PLATFORM_FEE_POISHA=0`, which is what `.env.example` and `render.yaml`
+   * both say to write, was the one setting that could not be set.
+   */
+  PLATFORM_FEE_POISHA: z.coerce.number().int().nonnegative().default(0),
+
+  // --- Database (DATABASE.md) ---------------------------------------------
+  DATABASE_URL: z.string().min(1),
+  DATABASE_POOL_MAX: positiveInt.max(200).default(10),
+
+  // --- Supabase Storage: signed URLs only (BACKEND.md §0) -----------------
+  SUPABASE_URL: z.string().default(''),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().default(''),
+  SUPABASE_STORAGE_BUCKET: z.string().default('healthcare-dev'),
+
+  /**
+   * Where an uploaded report file goes (`FR-LAB-03`, step 17).
+   *
+   * `mock` keeps the bytes in the API process and serves them back through a
+   * signed URL of this API's own, which is the correct implementation for the
+   * pitch version (CLAUDE.md §1.1) — the same standing `SMS_PROVIDER=log` and
+   * `PAYMENT_PROVIDER=mock` have. `supabase` is the real bucket, and needs the
+   * three keys above.
+   */
+  STORAGE_PROVIDER: z.enum(['mock', 'local', 'supabase']).default('mock'),
+  /**
+   * Where `STORAGE_PROVIDER=local` keeps files (pilot step 26): a directory on
+   * the hospital's own server, mounted as a volume and backed up with the
+   * database (DEPLOY.md). Relative paths are from the API's working directory.
+   */
+  STORAGE_DIR: z.string().min(1).default('./storage'),
+  /** How long a report's signed URL lasts, in seconds. */
+  STORAGE_URL_TTL_SECONDS: positiveInt.max(86_400).default(900),
+
+  // --- Auth ---------------------------------------------------------------
+  JWT_ACCESS_SECRET: secret,
+  JWT_REFRESH_SECRET: secret,
+  JWT_ACCESS_TTL: duration.default('15m'),
+  JWT_REFRESH_TTL: duration.default('30d'),
+  /**
+   * Staff lockout (pilot step 21, BACKEND.md §7.1): this many consecutive
+   * failed sign-ins lock an account for this many minutes. Counted per
+   * account, so guessing from many machines is stopped as surely as from one.
+   */
+  STAFF_LOCKOUT_ATTEMPTS: positiveInt.max(50).default(5),
+  STAFF_LOCKOUT_MINUTES: positiveInt.max(1_440).default(15),
+  /**
+   * The key the staff second factor's secrets and recovery codes are
+   * protected with (pilot step 28, FR-SEC-10, `config/totp.ts`). Required in
+   * production. Blank elsewhere derives one from `JWT_REFRESH_SECRET`, so a
+   * development machine and the pitch demo need no new variable — but a
+   * derived key dies with that secret, and every enrolled authenticator with
+   * it, which is why a real server must have its own.
+   */
+  TOTP_ENCRYPTION_KEY: z.union([z.literal(''), secret]).default(''),
+
+  // --- Guest tracking links (FR-GST-05) -----------------------------------
+  GUEST_LINK_SECRET: secret,
+  GUEST_LINK_TTL_DAYS: positiveInt.max(365).default(30),
+
+  // --- OTP (FR-SEC-05, FR-GST-03) -----------------------------------------
+  OTP_TTL_SECONDS: positiveInt.max(3_600).default(300),
+  OTP_MAX_PER_HOUR: positiveInt.max(100).default(5),
+
+  // --- SMS ----------------------------------------------------------------
+  // `http` is an aggregator reached over HTTPS (`adapters/smsHttp.ts`, plan
+  // H2): the three below it are then required, and so is the secret its
+  // delivery receipts are signed with. `local` still refuses everything.
+  SMS_PROVIDER: z.enum(['http', 'local', 'log']).default('log'),
+  SMS_API_URL: z.string().default(''),
+  SMS_API_KEY: z.string().default(''),
+  SMS_SENDER_ID: z.string().default(''),
+  SMS_DLR_SECRET: z.string().default(''),
+  SMS_MONTHLY_CAP: positiveInt.default(20_000),
+
+  // --- Web Push (VAPID) ---------------------------------------------------
+  VAPID_PUBLIC_KEY: z.string().default(''),
+  VAPID_PRIVATE_KEY: z.string().default(''),
+  VAPID_SUBJECT: z.string().default(''),
+
+  // --- Payments -----------------------------------------------------------
+  /**
+   * `off` (pilot step 26): no online payment at all — only paying at the
+   * hospital is offered, and an online method is refused before anything is
+   * written. What a hospital's own server runs until it has merchant accounts
+   * (CLAUDE.md §1.1), because the mock approves everything and must never
+   * face a real patient.
+   */
+  PAYMENT_PROVIDER: z.enum(['mock', 'live', 'off']).default('mock'),
+  /**
+   * Under `mock` only (plan H3): `inline` settles every charge on the spot, as
+   * the demonstration always has; `redirect` sends the patient to a page of
+   * the API's own that says it is a simulation and offers pay, fail and
+   * cancel, so the held serial and the return page can be shown and tested.
+   */
+  MOCK_PAYMENT_FLOW: z.enum(['inline', 'redirect']).default('inline'),
+  BKASH_BASE_URL: z.string().default(''),
+  BKASH_APP_KEY: z.string().default(''),
+  BKASH_APP_SECRET: z.string().default(''),
+  BKASH_USERNAME: z.string().default(''),
+  BKASH_PASSWORD: z.string().default(''),
+  NAGAD_BASE_URL: z.string().default(''),
+  NAGAD_MERCHANT_ID: z.string().default(''),
+  NAGAD_MERCHANT_NUMBER: z.string().default(''),
+  NAGAD_PUBLIC_KEY: z.string().default(''),
+  NAGAD_PRIVATE_KEY: z.string().default(''),
+
+  // --- Emergency travel time (FR-PAT-43) ----------------------------------
+  TRAVEL_TIME_MODE: z.enum(['static', 'api']).default('static'),
+  MAPS_API_KEY: z.string().default(''),
+
+  // --- Freshness (FR-OFF-04) ----------------------------------------------
+  STALE_THRESHOLD_MINUTES: positiveInt.max(1_440).default(10),
+
+  // --- Observability ------------------------------------------------------
+  SENTRY_DSN: z.string().default(''),
+  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
+
+  // --- Demo mode (FR-DEM-07) ----------------------------------------------
+  DEMO_MODE: boolish.default(false),
+
+  /**
+   * Whether this process writes each day's chambers from the weekly schedules
+   * (pilot step 22, BACKEND.md §8). On by default: a facility set up from
+   * `S-B-11` has nothing to book without it. The write is idempotent, so a
+   * second API instance may leave it on; it is here to switch off in a
+   * process that should never write.
+   */
+  SESSION_MATERIALISE: boolish.default(true),
+
+  /**
+   * Whether a guest booking must prove its phone with a code first (pilot
+   * step 25, `FR-GST-03`). Unset means: on, except on a demonstration.
+   */
+  GUEST_BOOKING_OTP: boolish.optional(),
+
+  /**
+   * The phones a demonstration accepts from a person (`FR-DEM-08`). Unset:
+   * the demonstration's own identities (`DEMO_PERSON_PHONES`). A comma list
+   * replaces them, each a Bangladeshi mobile. `any` turns the check off, and is
+   * refused below unless the database is on this machine: the test suites book
+   * with random numbers, and a demo whose database is anywhere else would
+   * store whatever anybody typed. Read only under `DEMO_MODE`.
+   */
+  DEMO_PHONES: z
+    .string()
+    .optional()
+    .transform((value, context): 'any' | readonly string[] | undefined => {
+      const trimmed = value?.trim() ?? '';
+      if (trimmed === '') return undefined;
+      if (trimmed === 'any') return 'any';
+      const phones: string[] = [];
+      for (const entry of trimmed.split(',')) {
+        if (entry.trim() === '') continue;
+        const phone = normaliseBdMobile(entry.trim());
+        if (phone === null) {
+          context.addIssue({
+            code: 'custom',
+            message: `not a Bangladeshi mobile: ${entry.trim()}`,
+          });
+          return z.NEVER;
+        }
+        phones.push(phone);
+      }
+      return phones;
+    }),
+
+  /**
+   * How many bookings one phone number may make without an account in a
+   * rolling day (`FR-GST-14`). One phone often books for a household, so
+   * this is generous; it stops a number being used to fill a doctor's list.
+   */
+  GUEST_BOOKINGS_PER_PHONE_PER_DAY: positiveInt.max(1_000).default(10),
+
+  /**
+   * How old the last good backup may be before `/readyz` says so (plan I2;
+   * `shared/domain` `org/deployment`). The same figure as the backup
+   * container's own `BACKUP_MAX_AGE_HOURS`, and set by the self-hosted stack
+   * to the same value. Unset, this deployment's backups are somebody else's
+   * (Supabase's, for the demonstration) and are reported as not watched.
+   */
+  BACKUP_MAX_AGE_HOURS: positiveInt.max(24 * 14).optional(),
+
+  /**
+   * How many hospitals' own applications may wait unanswered at once
+   * (`FR-ONB-09`). The form is public, and a workspace is cheap to ask for:
+   * at this many still setting up, the form is refused until the platform
+   * has looked at what is waiting. It limits nothing a platform
+   * administrator creates.
+   */
+  ORG_APPLICATIONS_OPEN_MAX: positiveInt.max(10_000).default(200),
+
+  /**
+   * How many reverse proxies sit in front of this process.
+   *
+   * Render terminates TLS and forwards the caller's address in
+   * `X-Forwarded-For`, so `req.ip` is the balancer's unless Express is told to
+   * trust one hop. It used to be derived from `NODE_ENV === 'production'`,
+   * which conflated two unrelated facts: a pitch deployment is behind a proxy
+   * *and* is not production — `DEMO_MODE` and `NODE_ENV=production` refuse to
+   * boot together, by design — so that derivation left the demo trusting no
+   * hops and every caller sharing one rate-limit bucket.
+   *
+   * Zero for a local process, one behind Render or Vercel. Never a large
+   * number: trusting more hops than exist lets a caller forge their own
+   * address by sending the header themselves.
+   */
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(3).default(0),
+
+  /**
+   * How many times over one address may use each per-address limit.
+   *
+   * The limits keyed on the caller's address (`middleware/rateLimit.ts`,
+   * `byIp`: thirty phone checks, ten standby places, ten emergency alerts in
+   * ten minutes, and the rest) stop a script before it reaches the database.
+   * They also count everybody who shares that address as one caller, and in
+   * Bangladesh an address is often not a person: a hospital's waiting room on
+   * the hospital's Wi-Fi is one, and a mobile carrier puts many subscribers
+   * behind one.
+   *
+   * One, the default, is right where each caller has an address of their own.
+   * A deployment whose patients arrive through a shared address raises it. The
+   * browser suite, which is a hundred and fifty patients on one machine, sets
+   * it to its ceiling (`playwright.config.ts`).
+   *
+   * It does not touch what protects a person: codes per number
+   * (`OTP_MAX_PER_HOUR`), the lock after five wrong codes, sign-in lockout.
+   * Those are in the database and are not keyed on an address.
+   */
+  ADDRESS_RATE_LIMIT_FACTOR: positiveInt.max(100).default(1),
+
+  /**
+   * The model that suggests import column mappings (`FR-IMP-16`), or `off`.
+   *
+   * `off` is the default and a complete product: the rules and the
+   * administrator's own choices carry an import with no model at all. `claude`
+   * asks Anthropic's Messages API for the columns the rules could not place.
+   * It is sent headings and column profiles and never a row (`FR-IMP-17`), so
+   * where it runs does not move patient data.
+   */
+  MAPPING_PROVIDER: z.enum(['off', 'claude']).default('off'),
+  /** The provider's API key. Required when `MAPPING_PROVIDER` is not `off`. */
+  MAPPING_API_KEY: z.string().default(''),
+  MAPPING_MODEL: z.string().trim().min(1).default('claude-opus-5-5'),
+  MAPPING_BASE_URL: httpUrl.default('https://api.anthropic.com'),
+  /**
+   * How long an administrator waits for suggestions before the screen opens
+   * without them. Suggestions are a convenience; the wait is bounded.
+   */
+  MAPPING_TIMEOUT_MS: positiveInt.max(120_000).default(20_000),
+
+  /**
+   * Browser origins this API answers besides the patient app's and the
+   * console's (`FR-BRD-04`): a hospital's portal at a name of its own, a
+   * hospital-branded app's web origin. Comma-separated, each an exact origin
+   * (`https://padma.example.com`), never a pattern: with credentials allowed,
+   * a pattern that matched too much would hand a hospital's session to
+   * whoever registered the name. Empty, which is the default, changes nothing.
+   */
+  EXTRA_ALLOWED_ORIGINS: z
+    .string()
+    .default('')
+    .transform((value) =>
+      value
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== ''),
+    )
+    .pipe(z.array(exactOrigin)),
+});
+
+export type Env = z.infer<typeof schema>;
+
+/**
+ * Keys that may be blank in development but never in production, with the
+ * reason each one matters, because "SUPABASE_SERVICE_ROLE_KEY is required" is
+ * less useful at three in the morning than knowing what breaks without it.
+ */
+const PRODUCTION_REQUIREMENTS: readonly {
+  readonly key: keyof Env;
+  readonly because: string;
+  readonly unless?: (env: Env) => boolean;
+}[] = [
+  {
+    key: 'SUPABASE_URL',
+    because: 'reports and prescriptions have nowhere to be stored',
+    unless: (env) => env.STORAGE_PROVIDER !== 'supabase',
+  },
+  {
+    key: 'SUPABASE_SERVICE_ROLE_KEY',
+    because: 'signed URLs cannot be issued, so no patient could open a report',
+    unless: (env) => env.STORAGE_PROVIDER !== 'supabase',
+  },
+  {
+    key: 'SMS_API_KEY',
+    because:
+      'a guest booking produces an SMS tracking link, and without it the patient has no way to follow their serial (FR-GST-05)',
+    unless: (env) => env.SMS_PROVIDER === 'log',
+  },
+  {
+    key: 'SMS_SENDER_ID',
+    because: 'the aggregator rejects messages without a registered sender',
+    unless: (env) => env.SMS_PROVIDER === 'log',
+  },
+  {
+    key: 'SMS_API_URL',
+    because: 'SMS_PROVIDER=http sends to this address, and without it no message leaves',
+    unless: (env) => env.SMS_PROVIDER !== 'http',
+  },
+  {
+    key: 'SMS_DLR_SECRET',
+    because:
+      'delivery receipts are believed only when signed with it, and without it every one is refused (FR-NOT-06)',
+    unless: (env) => env.SMS_PROVIDER !== 'http',
+  },
+  {
+    key: 'TOTP_ENCRYPTION_KEY',
+    because:
+      "administrators' second factors would be encrypted with a key derived from JWT_REFRESH_SECRET, and rotating that secret would lock every one of them out (FR-SEC-10)",
+  },
+  {
+    key: 'MAPPING_API_KEY',
+    because:
+      'MAPPING_PROVIDER names a model and there is no key to ask it with; set the key, or MAPPING_PROVIDER=off, which needs none (FR-IMP-16)',
+    unless: (env) => env.MAPPING_PROVIDER === 'off',
+  },
+  // VAPID keys are not required either: no adapter sends Web Push yet
+  // (`adapters/push.ts` has only the unconfigured one), so notifications go by
+  // SMS until one does (FR-NOT-02).
+  // SENTRY_DSN is not required: nothing reports to Sentry yet, and a
+  // required variable with no consumer is one a deploy fails on for no
+  // benefit (see API_BASE_URL). A self-hosted server's errors are in its logs.
+];
+
+/**
+ * Parses and validates the environment, or throws with every problem listed.
+ *
+ * Takes the source so tests can exercise it without touching the real process,
+ * and so a worker can validate its own subset later.
+ */
+export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
+  // Only when reading the real environment. A caller passing its own source —
+  // the tests — is describing a complete environment and must not have a file
+  // merged into it.
+  if (source === process.env) loadDotEnv();
+
+  const parsed = schema.safeParse(source);
+
+  if (!parsed.success) {
+    throw new EnvError(
+      parsed.error.issues.map((issue) => ({
+        key: issue.path.join('.') || '(root)',
+        message: issue.message,
+      })),
+    );
+  }
+
+  const env = parsed.data;
+  const problems: { key: string; message: string }[] = [];
+
+  // FR-DEM-08: switching the demonstration's phone check off is for a
+  // database on this machine and nowhere else.
+  if (env.DEMO_PHONES === 'any' && !onThisMachine(env.DATABASE_URL)) {
+    problems.push({
+      key: 'DEMO_PHONES',
+      message:
+        '"any" is accepted only with a local database — elsewhere a demonstration would store any number typed into it (FR-DEM-08)',
+    });
+  }
+
+  if (env.NODE_ENV === 'production') {
+    for (const requirement of PRODUCTION_REQUIREMENTS) {
+      if (requirement.unless?.(env) === true) continue;
+      if (env[requirement.key] === '') {
+        problems.push({
+          key: String(requirement.key),
+          message: `required in production — without it, ${requirement.because}`,
+        });
+      }
+    }
+
+    // FR-SEC-08 and FR-DEM-07: demo mode allows seeding and reset, forces the
+    // mock payment adapter and shows a demonstration banner. None of that
+    // belongs in front of real patients.
+    if (env.DEMO_MODE) {
+      problems.push({
+        key: 'DEMO_MODE',
+        message:
+          'must be false in production — it permits database reset and mock payments (FR-SEC-08)',
+      });
+    }
+
+    if (env.PAYMENT_PROVIDER === 'mock') {
+      problems.push({
+        key: 'PAYMENT_PROVIDER',
+        message: 'must be "live" or "off" in production — the mock adapter approves every payment',
+      });
+    }
+
+    if (env.STORAGE_PROVIDER === 'mock') {
+      problems.push({
+        key: 'STORAGE_PROVIDER',
+        message:
+          'must be "local" or "supabase" in production — the mock store keeps report files in process memory, so a restart loses every report a lab uploaded (FR-LAB-03)',
+      });
+    }
+
+    // Accepted by the schema, and its keys asked for above, but there is no
+    // adapter behind it in this version (`adapters/storage.ts`): every report
+    // and every patient's document would be refused at upload. A real server
+    // keeps files on its own disk (pilot-readiness audit, F-04).
+    if (env.STORAGE_PROVIDER === 'supabase') {
+      problems.push({
+        key: 'STORAGE_PROVIDER',
+        message:
+          'must be "local" in production — this version has no Supabase Storage adapter, so every lab report and patient document upload would be refused (FR-LAB-03, FR-PAT-62)',
+      });
+    }
+
+    if (env.JWT_ACCESS_SECRET === env.JWT_REFRESH_SECRET) {
+      problems.push({
+        key: 'JWT_REFRESH_SECRET',
+        message:
+          'must differ from JWT_ACCESS_SECRET — sharing them lets a 15-minute access token be replayed as a 30-day refresh token',
+      });
+    }
+
+    // The tracking link's key and the second factor's key are each one
+    // secret's whole job (plan I2b). A link key equal to a token key makes one
+    // stolen secret both; a second-factor key equal to either means whoever
+    // can sign a token can read every administrator's authenticator seed.
+    const tokenKeys = [env.JWT_ACCESS_SECRET, env.JWT_REFRESH_SECRET];
+    if (tokenKeys.includes(env.GUEST_LINK_SECRET)) {
+      problems.push({
+        key: 'GUEST_LINK_SECRET',
+        message: 'must differ from both JWT secrets — a tracking link is signed with its own key',
+      });
+    }
+    if (
+      env.TOTP_ENCRYPTION_KEY !== '' &&
+      [...tokenKeys, env.GUEST_LINK_SECRET].includes(env.TOTP_ENCRYPTION_KEY)
+    ) {
+      problems.push({
+        key: 'TOTP_ENCRYPTION_KEY',
+        message:
+          'must differ from the JWT and tracking-link secrets — it encrypts what a second factor is made from (FR-SEC-10)',
+      });
+    }
+  }
+
+  if (problems.length > 0) throw new EnvError(problems);
+
+  return env;
+}
+
+/** Thrown at boot, with every problem at once rather than the first. */
+export class EnvError extends Error {
+  readonly problems: readonly { readonly key: string; readonly message: string }[];
+
+  constructor(problems: readonly { readonly key: string; readonly message: string }[]) {
+    super(
+      [
+        `Environment is not valid (${String(problems.length)} problem(s)):`,
+        '',
+        ...problems.map((problem) => `  ${problem.key}: ${problem.message}`),
+        '',
+        'See .env.example for the full list (BACKEND.md §10).',
+      ].join('\n'),
+    );
+    this.name = 'EnvError';
+    this.problems = problems;
+  }
+}
+
+/**
+ * The validated environment, read once at module load.
+ *
+ * Imported directly by the infrastructure modules. Everything above the
+ * infrastructure layer receives what it needs as an argument, so a service is
+ * testable without an environment at all.
+ */
+export const env: Env = loadEnv();
+
+export const isProduction = (): boolean => env.NODE_ENV === 'production';
+export const isTest = (): boolean => env.NODE_ENV === 'test';

@@ -1,0 +1,112 @@
+/**
+ * The patient's side of a console spec: book as a guest, keep the SMS link.
+ *
+ * The same steps `two-device-queue.spec.ts` takes, shared here for specs that
+ * need a patient's phone on a chamber they are driving from the console. The
+ * canary keeps its own copy on purpose: it is the one spec that must never
+ * change because something else did.
+ */
+
+import { expect, type BrowserContext, type Page } from '@playwright/test';
+
+import { isProductionConfiguration } from './consoleSession.js';
+import { issueTrackingLink } from './guestLink.js';
+
+import type { ConsoleSession } from './console.js';
+
+const PATIENT = 'http://localhost:3000';
+
+/** A phone nobody else in the run will use (`DB-P6` normalised). */
+export function guestPhone(): string {
+  const tail = String(Math.floor(Math.random() * 90_000_000) + 10_000_000);
+  return `+88019${tail}`;
+}
+
+/** Books a guest serial on the spec's chamber and returns the tracking link. */
+export async function bookAsGuest(page: Page, session: ConsoleSession): Promise<string> {
+  await page.goto(`${PATIENT}/book?specialty=${session.departmentCode}`);
+
+  await page.getByTestId(`hospital-${session.hospitalId}`).click();
+  await page.getByTestId(`doctor-${session.doctorId}`).click();
+  await page.getByTestId(`session-${session.sessionId}`).click();
+
+  await page.getByLabel('রোগীর নাম').fill('রহিমা খাতুন');
+  await page.getByLabel('মোবাইল নম্বর').fill(guestPhone());
+  await page.getByLabel('বয়স').fill('34');
+  await page.getByRole('button', { name: 'বিকাশ' }).click();
+  await page.getByTestId('confirm-booking').click();
+
+  await expect(page.getByTestId('booking-success')).toBeVisible();
+
+  const href = await page.getByTestId('tracking-link').getAttribute('href');
+  if (href === null) throw new Error('the success screen issued no tracking link');
+  return href;
+}
+
+/** Opens the live serial from the SMS link, on its own device. */
+export async function openLiveSerial(context: BrowserContext, trackingUrl: string): Promise<Page> {
+  const page = await context.newPage();
+  await page.goto(trackingUrl);
+  await expect(page.getByTestId('live-serial')).toBeVisible();
+  return page;
+}
+
+/**
+ * Joins a full chamber's standby list through the booking flow
+ * (`BTN-A06D-STANDBY`, `FR-PAT-25`), and lands on its status page.
+ *
+ * `prepay` picks the ruling's first choice — pay now, seated on sight
+ * (`FR-PAT-26`) — or its second, asked on the phone (`FR-PAT-27`).
+ */
+export async function joinStandbyAsGuest(
+  page: Page,
+  session: ConsoleSession,
+  prepay: boolean,
+): Promise<void> {
+  await page.goto(`${PATIENT}/book?specialty=${session.departmentCode}`);
+
+  await page.getByTestId(`hospital-${session.hospitalId}`).click();
+  await page.getByTestId(`doctor-${session.doctorId}`).click();
+  await page.getByTestId(`standby-join-${session.sessionId}`).click();
+
+  const form = page.getByTestId('standby-join');
+  await expect(form).toBeVisible();
+  await form.getByLabel('রোগীর নাম').fill('জাহানারা বেগম');
+  // Typed the way people write it, 019…, not the stored +88019… (`DB-P6`):
+  // the form normalises, and every standby spec exercises that.
+  await form.getByLabel('মোবাইল নম্বর').fill(guestPhone().replace(/^\+88/, ''));
+  await form.getByLabel('বয়স').fill('52');
+  await form.getByTestId(prepay ? 'standby-choice-prepay' : 'standby-choice-ask').click();
+  await form.getByTestId('standby-confirm').click();
+
+  // The first spec to land here pays for the dev server compiling `/standby`:
+  // in a full run that navigation has taken longer than the default ten
+  // seconds, with the URL already chosen and the page still building. Waiting
+  // longer for that one navigation is not a retry — it asserts the same thing.
+  await expect(page).toHaveURL(/\/standby\?t=/, { timeout: 45_000 });
+  await expect(page.getByTestId('standby-status')).toBeVisible({ timeout: 20_000 });
+}
+
+/**
+ * A patient's link to the live serial on the spec's chamber, by whichever way
+ * the configuration allows.
+ *
+ * Under the demonstration the patient books, as a guest, through the app —
+ * `bookAsGuest`, unchanged. Under the production configuration nobody can: a
+ * guest's phone is proved with a code first, the code travels by SMS, and
+ * there is no SMS provider yet (`docs/STATUS.md`, the first blocker). There
+ * the link is the one an SMS would have carried, for the last patient already
+ * waiting in the chamber (`guestLink.ts`).
+ *
+ * For specs whose subject is the counter and which only need a second screen
+ * to watch it from. A spec about booking calls `bookAsGuest` and has no place
+ * in the production configuration until an SMS provider exists.
+ */
+export async function trackingLinkOn(page: Page, session: ConsoleSession): Promise<string> {
+  if (!isProductionConfiguration()) return await bookAsGuest(page, session);
+
+  const last = Math.max(...session.bookingsBySerial.keys());
+  const booking = session.bookingsBySerial.get(last);
+  if (booking === undefined) throw new Error('the fixture holds no bookings');
+  return await issueTrackingLink(booking);
+}

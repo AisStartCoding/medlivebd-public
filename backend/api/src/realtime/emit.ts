@@ -1,0 +1,443 @@
+/**
+ * Typed emitters, and the seam the transport plugs into (BACKEND.md §3).
+ *
+ * ## Why there is an interface here at all
+ *
+ * BACKEND.md §0 fixes Socket.IO as the transport, and that is what will be
+ * behind this. The interface exists for two reasons that outlive the choice:
+ *
+ * A broadcast is a side effect a service performs, and services are the only
+ * layer allowed to perform one (CLAUDE.md §7). Keeping the transport behind a
+ * narrow interface means the layering rule has something to point at — a
+ * repository importing `socket.io` fails lint, a repository importing this
+ * file fails lint, and neither depends on remembering.
+ *
+ * And it makes the broadcast assertable. `NFR-01` is a two-second promise from
+ * a reception tap to a patient's phone, and the test that proves the queue
+ * service broadcasts at all should not need a socket server, a port and a
+ * client connection to do it.
+ *
+ * The queue service calls `emitter().queueUpdated(...)` and does not know or
+ * care what is on the other side.
+ */
+
+import {
+  patientViewOf,
+  type BedView,
+  type EmergencyCaseView,
+  type Eta,
+  type PublicCapacity,
+  type QueueState,
+  type ReferralView,
+  type TestOrderView,
+} from '@platform/domain';
+
+import { logger } from '../config/logger.js';
+import { ticketsIn } from '../config/serialTicket.js';
+
+import { ROOMS, type AppliedAction, type RealtimeEnvelope } from './rooms.js';
+
+/** What a transport must be able to do. Deliberately tiny. */
+export interface RealtimeEmitter {
+  /** Publishes one envelope into one room. */
+  emit(room: string, event: string, envelope: RealtimeEnvelope): void;
+}
+
+/**
+ * The payload a session room receives after any queue mutation.
+ *
+ * `{ seq, state, etas, serverTs }` exactly as BACKEND.md §4.1 step 10 names
+ * it. A client folds it by `seq`: anything at or below what it already has is
+ * a duplicate it must ignore, which is what makes an optimistic console and a
+ * reconnecting socket converge instead of double-counting (`SY-01`).
+ */
+export interface QueueUpdatedPayload {
+  readonly state: QueueState;
+  readonly etas: readonly Eta[];
+}
+
+/**
+ * Records every emission instead of sending it.
+ *
+ * The default until the socket server is wired in, and what the tests assert
+ * against. It is not a stub standing in for missing behaviour: a queue
+ * mutation that reaches this has done everything the request asked of it, and
+ * the only thing missing is a listener.
+ */
+export class RecordingEmitter implements RealtimeEmitter {
+  private readonly sent: { room: string; event: string; envelope: RealtimeEnvelope }[] = [];
+
+  emit(room: string, event: string, envelope: RealtimeEnvelope): void {
+    this.sent.push({ room, event, envelope });
+    logger.debug({ room, event, seq: envelope.seq }, 'realtime emit');
+  }
+
+  /** Everything emitted, oldest first. */
+  all(): readonly { room: string; event: string; envelope: RealtimeEnvelope }[] {
+    return this.sent;
+  }
+
+  /** Everything emitted into one room. */
+  forRoom(room: string): readonly { event: string; envelope: RealtimeEnvelope }[] {
+    return this.sent.filter((entry) => entry.room === room);
+  }
+
+  clear(): void {
+    this.sent.length = 0;
+  }
+}
+
+let current: RealtimeEmitter = new RecordingEmitter();
+
+/** The emitter services publish through. */
+export function emitter(): RealtimeEmitter {
+  return current;
+}
+
+/**
+ * Replaces the emitter.
+ *
+ * Called once at boot by `server.ts` when the socket server exists, and by
+ * tests that want to assert on what was published.
+ */
+export function setEmitter(next: RealtimeEmitter): void {
+  current = next;
+}
+
+/** Restores the recording default. */
+export function resetEmitter(): RecordingEmitter {
+  const fresh = new RecordingEmitter();
+  current = fresh;
+  return fresh;
+}
+
+// ---------------------------------------------------------------------------
+// The typed publishers services actually call
+// ---------------------------------------------------------------------------
+
+/**
+ * `queue.updated` — the broadcast the whole product is built around.
+ *
+ * Every waiting patient's phone updates from this (`FR-QUE-40`, `NFR-01`: two
+ * seconds end to end). It carries the full state rather than a delta, because
+ * a client that missed one message must not be left holding a queue that is
+ * quietly wrong; the resume-from-seq path exists for the case where a client
+ * wants the events it missed instead.
+ *
+ * `applied` names the console actions the write behind this broadcast put in
+ * the log (`SY-08`): those and nothing older. It is empty when no action is
+ * behind it — a roster change. The answer to the request says the same thing
+ * by another road, and a console acts on whichever it hears first.
+ */
+export function queueUpdated(
+  sessionId: string,
+  payload: QueueUpdatedPayload,
+  seq: number,
+  serverTs: string,
+  applied: readonly AppliedAction[] = [],
+): void {
+  emitter().emit(ROOMS.sessionStaff(sessionId), 'queue.updated', {
+    type: 'queue.updated',
+    seq,
+    serverTs,
+    applied,
+    data: payload,
+  });
+  // The patients' copy (plan I2c): the same queue, naming nobody. No console
+  // actions either: a phone has none to settle.
+  emitter().emit(ROOMS.session(sessionId), 'queue.updated', {
+    type: 'queue.updated',
+    seq,
+    serverTs,
+    applied: [],
+    data: patientViewOf(payload.state, payload.etas, ticketsIn(sessionId)),
+  });
+}
+
+/** `session.delayed` — a declared delay, so a client can show it at once. */
+export function sessionDelayed(
+  sessionId: string,
+  data: {
+    readonly minutes: number;
+    readonly totalDelayMinutes: number;
+    readonly reason: string | null;
+  },
+  seq: number,
+  serverTs: string,
+): void {
+  for (const room of [ROOMS.sessionStaff(sessionId), ROOMS.session(sessionId)]) {
+    emitter().emit(room, 'session.delayed', { type: 'session.delayed', seq, serverTs, data });
+  }
+}
+
+/** `session.ended` — stop polling, the chamber is closed (`FR-REC-06`). */
+export function sessionEnded(sessionId: string, seq: number, serverTs: string): void {
+  for (const room of [ROOMS.sessionStaff(sessionId), ROOMS.session(sessionId)]) {
+    emitter().emit(room, 'session.ended', { type: 'session.ended', seq, serverTs, data: {} });
+  }
+}
+
+/**
+ * `patient.called` — targeted at one patient (BACKEND.md §6).
+ *
+ * Emitted into the patient's own room rather than the session's, because
+ * "you are being called now" is addressed to one person and the rest of the
+ * waiting room has no business receiving it.
+ */
+export function patientCalled(
+  patientId: string,
+  data: { readonly sessionId: string; readonly bookingId: string; readonly serial: number },
+  seq: number,
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.patient(patientId), 'patient.called', {
+    type: 'patient.called',
+    seq,
+    serverTs,
+    data,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The bed board (`hospital:<id>:beds`, BACKEND.md §6)
+// ---------------------------------------------------------------------------
+
+/**
+ * `bed.updated` — the beds one action changed, as the board shows them.
+ *
+ * A transfer changes two, so the payload is a list. It carries no patient
+ * identity: the room is every staff console at the hospital, and a name on a
+ * broadcast is a name read by everyone listening (`DB-P7`).
+ */
+export function bedUpdated(
+  hospitalId: string,
+  data: {
+    readonly beds: readonly BedView[];
+    /** The console action behind the change, by its own key; null when nobody's (`SY-09`). */
+    readonly clientEventId?: string | null;
+  },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.beds(hospitalId), 'bed.updated', {
+    type: 'bed.updated',
+    serverTs,
+    data,
+  });
+}
+
+/**
+ * `capacity.updated` — what the public is now being shown (`FR-BED-05`).
+ *
+ * Read back from `v_public_hospital_capacity` after the change committed, not
+ * computed from it, so `<CapacityMirror>` shows the published figure and not
+ * the console's own opinion of what it should be (`FR-BED-06`).
+ */
+export function capacityUpdated(
+  hospitalId: string,
+  capacity: PublicCapacity,
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.beds(hospitalId), 'capacity.updated', {
+    type: 'capacity.updated',
+    serverTs,
+    data: capacity,
+  });
+}
+
+/**
+ * `bedrequest.updated` — a request arrived or was answered (`FR-BED-07`).
+ *
+ * Only the id and the state. The pending list is re-read on this, through the
+ * endpoint that audits the read, rather than receiving a patient's name over
+ * a broadcast.
+ */
+export function bedRequestUpdated(
+  hospitalId: string,
+  data: { readonly requestId: string; readonly state: string },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.beds(hospitalId), 'bedrequest.updated', {
+    type: 'bedrequest.updated',
+    serverTs,
+    data,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The ER console (`hospital:<id>:emergency`, BACKEND.md §6)
+// ---------------------------------------------------------------------------
+
+/**
+ * `emergency.inbound` — "I'm on my way" has arrived (`FR-EMG-01`, `FR-PAT-46`).
+ *
+ * The console rings on this. It carries the case as the console lists it —
+ * the problem, the ETA, an age and sex if given, whether a number was left —
+ * and never the number itself: the room is every staff console at the
+ * hospital, and the number is read one case at a time, audited (`DB-P7`).
+ */
+export function emergencyInbound(
+  hospitalId: string,
+  data: { readonly case: EmergencyCaseView },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.emergency(hospitalId), 'emergency.inbound', {
+    type: 'emergency.inbound',
+    serverTs,
+    data,
+  });
+}
+
+/** `emergency.updated` — a case moved: prepared, accepted, triaged, declined, called off. */
+export function emergencyUpdated(
+  hospitalId: string,
+  data: {
+    readonly case: EmergencyCaseView;
+    readonly load: number;
+    /** The console action behind the change, by its own key; null when nobody's (`SY-09`). */
+    readonly clientEventId?: string | null;
+  },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.emergency(hospitalId), 'emergency.updated', {
+    type: 'emergency.updated',
+    serverTs,
+    data,
+  });
+}
+
+/**
+ * `capabilities.updated` — the coordinator confirmed the list (`FR-EMG-05`).
+ *
+ * Into the emergency room so a second ER screen shows the same switches. The
+ * public reads the view on every search, so a family sees the change on
+ * their next search without any broadcast.
+ */
+export function capabilitiesUpdated(
+  hospitalId: string,
+  data: {
+    readonly capabilities: readonly {
+      readonly kind: string;
+      readonly available: boolean;
+      readonly updatedAt: string;
+    }[];
+  },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.emergency(hospitalId), 'capabilities.updated', {
+    type: 'capabilities.updated',
+    serverTs,
+    data,
+  });
+}
+
+/**
+ * `emergency.handoff` — the ER handed a case to the ward, or the ward placed
+ * it (`BTN-B07-ADMIT`, `FR-BED-07`).
+ *
+ * Into the *beds* room: the ward board is who has to act on it. Like
+ * `bedrequest.updated`, only the id and the state — the pending list is
+ * re-read on this.
+ */
+export function emergencyHandoff(
+  hospitalId: string,
+  data: { readonly caseId: string; readonly state: string },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.beds(hospitalId), 'emergency.handoff', {
+    type: 'emergency.handoff',
+    serverTs,
+    data,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Referrals between ERs (`FR-EMG-07..09`, BACKEND.md §6)
+// ---------------------------------------------------------------------------
+
+/**
+ * `referral.incoming` — another ER is asking this one to take somebody
+ * (`FR-EMG-09`, `LIST-B07-IN`). The receiving console rings on this.
+ *
+ * Into the receiving hospital's emergency room. The referral names nobody —
+ * problem, colour, age, sex, a note — so a broadcast of it is not an
+ * identifying read (`DB-P7`).
+ */
+export function referralIncoming(
+  hospitalId: string,
+  data: { readonly referral: ReferralView },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.emergency(hospitalId), 'referral.incoming', {
+    type: 'referral.incoming',
+    serverTs,
+    data,
+  });
+}
+
+/**
+ * `referral.updated` — a step of the timeline (`FR-EMG-08`): seen, accepted,
+ * declined, withdrawn, arrived.
+ *
+ * Into the emergency room of each hospital named. Both ends' consoles already
+ * listen there, so a room per referral would be one more subscription every
+ * console had to remember to make — and a forgotten one reaches nobody,
+ * silently.
+ */
+export function referralUpdated(
+  hospitalIds: readonly string[],
+  data: { readonly referral: ReferralView },
+  serverTs: string,
+): void {
+  for (const hospitalId of new Set(hospitalIds)) {
+    emitter().emit(ROOMS.emergency(hospitalId), 'referral.updated', {
+      type: 'referral.updated',
+      serverTs,
+      data,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The lab (`hospital:<id>:lab`, BACKEND.md §6)
+// ---------------------------------------------------------------------------
+
+/**
+ * `test.ordered` — a doctor has ticked test chips and signed (`FR-DOC-06`,
+ * `FR-LAB-01`).
+ *
+ * Into the hospital's lab room, so an order appears on a bench's screen
+ * without anybody refreshing. The order carries the test and its stamps and
+ * not the patient: the room is every lab console at the hospital, and the
+ * name a bench needs to call somebody is fetched by the one console that
+ * needs it, through an audited read (`DB-P7`).
+ */
+export function testOrdered(
+  hospitalId: string,
+  data: { readonly orders: readonly TestOrderView[] },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.lab(hospitalId), 'test.ordered', {
+    type: 'test.ordered',
+    serverTs,
+    data,
+  });
+}
+
+/**
+ * `test.updated` — a state button, an uploaded report, or a delivery
+ * (`FR-LAB-02`, `FR-LAB-03`).
+ *
+ * One order, after commit. Two benches working the same queue see each
+ * other's taps, which is what stops a sample being collected twice.
+ */
+export function testUpdated(
+  hospitalId: string,
+  data: { readonly order: TestOrderView },
+  serverTs: string,
+): void {
+  emitter().emit(ROOMS.lab(hospitalId), 'test.updated', {
+    type: 'test.updated',
+    serverTs,
+    data,
+  });
+}

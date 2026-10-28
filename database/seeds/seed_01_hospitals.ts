@@ -1,0 +1,715 @@
+/**
+ * `FR-DEM-01` — the six demo facilities, and everything that belongs to a
+ * facility rather than to a doctor: settings, departments, published
+ * capabilities and staff.
+ *
+ * The facilities themselves are declared in `data/hospitals.ts`, which is the
+ * demo set CLAUDE.md §8 refers to. This module writes them.
+ *
+ * Two details here are demo *content* rather than bookkeeping, and both exist
+ * to make the emergency scenario an honest one (`PRD.md` §24 step 7):
+ *
+ *   - a capability is published with an `updated_at` of its own, staggered, so
+ *     one facility's capacity data is deliberately stale. `FR-PAT-45` de-ranks
+ *     a stale facility and `FR-OFF-04` labels it; a demo where every row was
+ *     written a second ago cannot show either.
+ *   - two declared capabilities are marked unavailable, so a burn case has a
+ *     real choice between two hospitals instead of one obvious answer.
+ */
+
+import { createHash } from 'node:crypto';
+
+import { DEMO_FACILITIES } from './data/hospitals.js';
+import { composeName, rosterFor } from './data/people.js';
+import { isDeclaredDistrict, specialty } from './data/reference.js';
+import {
+  DEMO_MARKER,
+  demoEmail,
+  demoHospitalCode,
+  demoPasswordHash,
+  labelBn,
+  labelEn,
+} from './lib/demo.js';
+import { insertRows } from './lib/insert.js';
+import { facilityIds } from './lib/lookup.js';
+import { markPng } from './lib/markPng.js';
+
+import type { SeedContext, SeedModule, SeedSummary } from './lib/runner.js';
+
+/**
+ * Capabilities a facility has but cannot take a patient for right now.
+ *
+ * `capabilities.is_available` is a live operational fact, not a statement about
+ * what the building contains — a burn unit with every bed occupied is a burn
+ * unit that cannot accept the next burn case, and sending one there anyway is
+ * the failure `FR-EMG-05` exists to prevent.
+ */
+const UNAVAILABLE: readonly { hospitalSlug: string; kind: string }[] = [
+  // The cath lab is down, so a cardiac case routes to Shapla instead.
+  { hospitalSlug: 'jamuna-medical-college', kind: 'cath_lab' },
+  // Isolation is full at the larger private hospital.
+  { hospitalSlug: 'shapla-general', kind: 'isolation' },
+];
+
+/**
+ * How long ago each facility last confirmed its capability rows, in minutes.
+ *
+ * `hospital_settings.stale_threshold_minutes` defaults to 10 (`FR-OFF-04`), so
+ * Karnaphuli's three-hour-old data reads as stale and Meghna's is on the edge.
+ * That is the point: the patient-facing rule is that a live number always
+ * carries its freshness and a stale one says so (`PRD.md` §3.2).
+ */
+/**
+ * The hospitals that offer a preferred arrival hour at booking (`FR-PAT-28`,
+ * plan R1). One, so the demo shows the choice at one hospital and its absence
+ * everywhere else, which is the setting's default.
+ */
+const ARRIVAL_WINDOWS: ReadonlySet<string> = new Set(['padma-specialised']);
+
+const CAPABILITY_AGE_MINUTES: Readonly<Record<string, number>> = {
+  'shapla-general': 3,
+  'padma-specialised': 2,
+  'karnaphuli-general': 190,
+  'jamuna-medical-college': 7,
+  'meghna-diagnostic': 45,
+  'buriganga-clinic': 9,
+};
+
+/**
+ * What each facility refunds on a cancellation (`FR-PAY-03`).
+ *
+ * The shape is `shared/domain/src/payments/refund.ts`, which defines it
+ * because no document does — recorded as an open decision. These are a
+ * hospital's own terms toward its patients, which is operational
+ * configuration like the consultation fees in `seed_02`, not the commercial
+ * content `CLAUDE.md` §1.1 keeps out of the repository.
+ *
+ * **Two facilities are deliberately left out.** Karnaphuli and Buriganga have
+ * no policy on file, so a cancellation there says "ফেরতের বিষয়টি হাসপাতাল
+ * জানাবে" instead of a percentage — which is the honest-degradation case
+ * (`PRD.md` §3.2) and the one a demo should be able to show.
+ */
+/**
+ * One facility with colours of its own (`FR-BRD-03`, migration 0036).
+ *
+ * Padma, so that the demonstration can show what a hospital-branded patient
+ * app is: the same app, opened for one hospital (`?scope=PADMA`), in that
+ * hospital's name and colours. A navy ramp that passes the contrast rules in
+ * `shared/domain/src/brand/theme.ts`; `brand.test` and the API's own test
+ * hold it to them. Every other facility has none and appears in the
+ * platform's green, which is the ordinary state.
+ */
+const BRANDS: Readonly<Record<string, { colors: Record<string, string> }>> = {
+  'padma-specialised': {
+    colors: {
+      'brand-900': '#0b2239',
+      'brand-700': '#123a5e',
+      'brand-600': '#17507f',
+      'brand-300': '#8fc1ea',
+      'brand-100': '#e7eff6',
+      'brand-border': '#c5d6e6',
+    },
+  },
+};
+
+/**
+ * The modules a facility does not run (`FR-BRD-11`, migration 0047).
+ *
+ * A diagnostic centre keeps no pharmacy shelf; a small clinic has no ward.
+ * Each holds nothing of what is off here (the centre stocks no medicine,
+ * `data/beds.ts` gives the clinic no bed), so the demonstration has two
+ * facilities whose settings and whose workspace on the platform's screen show
+ * a module switched off. Every other facility runs everything, which is the
+ * ordinary state.
+ *
+ * The centre's beds stay on though it has none: "runs beds and has none" is a
+ * state of its own, which a card says as zero and not as "not shared", and
+ * the bed tests stand on it.
+ */
+const MODULES_OFF: Readonly<Record<string, readonly string[]>> = {
+  'meghna-diagnostic': ['pharmacy'],
+  'buriganga-clinic': ['beds'],
+};
+
+/**
+ * The live figures a facility does not share with the network (`FR-NET-04`,
+ * migration 0048).
+ *
+ * One facility keeps one figure, so the demonstration shows what that looks
+ * like from both sides: the clinic's settings have the switch off, and its
+ * card in the patient app says its serial figures are not shared, where
+ * every other card gives a count. Its doctors, when they sit and its
+ * chambers are all still there to book. Every other facility shares
+ * everything, which is the ordinary state.
+ */
+const UNPUBLISHED: Readonly<Record<string, readonly string[]>> = {
+  'buriganga-clinic': ['serials'],
+};
+
+/**
+ * Where each facility's agreement stands (`FR-SUP-04`, migration 0051).
+ *
+ * A record on the platform's screen and nothing else: it switches no module
+ * and unlists nobody. Most are active, which is the ordinary state; the
+ * centre is still in its trial, and the clinic is overdue with a note, so the
+ * demonstration shows the two states somebody at `S-B-12` has to act on. No
+ * plan and no amount, here or anywhere (`CLAUDE.md` §1.2).
+ */
+const AGREEMENTS: Readonly<
+  Record<string, { readonly state: string; readonly note: string | null; readonly daysAgo: number }>
+> = {
+  'shapla-general': { state: 'active', note: null, daysAgo: 12 },
+  'padma-specialised': { state: 'active', note: null, daysAgo: 12 },
+  'karnaphuli-general': { state: 'active', note: null, daysAgo: 12 },
+  'jamuna-medical-college': { state: 'active', note: null, daysAgo: 12 },
+  'buriganga-clinic': {
+    state: 'overdue',
+    note: 'নবায়নের কাগজ এখনো আসেনি, প্রশাসককে ফোন করা হয়েছে (ডেমো)',
+    daysAgo: 3,
+  },
+};
+
+const REFUND_POLICIES: Readonly<
+  Record<
+    string,
+    {
+      cutoffHours: number;
+      beforeCutoffPercent: number;
+      afterCutoffPercent: number;
+      platformFeeRefundable: boolean;
+    }
+  >
+> = {
+  // Generous, and the one to demonstrate with.
+  'shapla-general': {
+    cutoffHours: 12,
+    beforeCutoffPercent: 100,
+    afterCutoffPercent: 50,
+    platformFeeRefundable: false,
+  },
+  'padma-specialised': {
+    cutoffHours: 24,
+    beforeCutoffPercent: 100,
+    afterCutoffPercent: 25,
+    platformFeeRefundable: false,
+  },
+  // A government hospital, where the consultation is nominal anyway.
+  'jamuna-medical-college': {
+    cutoffHours: 6,
+    beforeCutoffPercent: 100,
+    afterCutoffPercent: 100,
+    platformFeeRefundable: true,
+  },
+  'meghna-diagnostic': {
+    cutoffHours: 24,
+    beforeCutoffPercent: 80,
+    afterCutoffPercent: 0,
+    platformFeeRefundable: false,
+  },
+};
+
+/** Per-role email local part and ID-card code, in roster order. */
+const ROLE_CODES: Readonly<Record<string, string>> = {
+  hospital_admin: 'ADM',
+  receptionist: 'REC',
+  doctor: 'DOC',
+  ward: 'WRD',
+  emergency: 'EMR',
+  lab: 'LAB',
+  pharmacy: 'PHR',
+};
+
+export const seed01Hospitals: SeedModule = {
+  name: 'seed_01_hospitals',
+  title: 'six demo facilities, departments, capabilities, staff and the national viewer',
+  requirements: ['FR-DEM-01', 'FR-DEM-07', 'FR-EMG-05', 'FR-ROLE-01'],
+  writes: [
+    'hospitals',
+    'hospital_settings',
+    'hospital_logos',
+    'departments',
+    'capabilities',
+    'staff_users',
+    'staff_roles',
+  ],
+
+  async run({ client, now, rng, log }: SeedContext): Promise<SeedSummary> {
+    const names = rng.stream('staff-names');
+
+    // --- hospitals ---------------------------------------------------------
+    //
+    // A district is checked against the declared list before it is written.
+    // `hospitals.district` is an indexed text column that discovery search
+    // filters on, so a typo there does not fail — it produces a facility
+    // nobody can find, which is the worst kind of wrong (CLAUDE.md §8).
+    for (const facility of DEMO_FACILITIES) {
+      if (!isDeclaredDistrict(facility.division, facility.district)) {
+        throw new Error(
+          `${facility.slug} is in ${facility.district}, ${facility.division}, which is not in DEMO_DISTRICTS (data/reference.ts).`,
+        );
+      }
+    }
+
+    // `created_by` stays null. It references `staff_users`, which cannot exist
+    // before the facility does, and more honestly: a seeded facility was not
+    // created by a person. DB-P3 asks for `created_by` on rows a human made.
+    const hospitalRows = DEMO_FACILITIES.map((facility) => [
+      demoHospitalCode(facility.slug),
+      labelBn(facility.nameBn),
+      labelEn(facility.nameEn),
+      facility.kind,
+      facility.division,
+      facility.district,
+      facility.thana,
+      facility.addressBn,
+      facility.addressEn,
+      facility.descriptionBn,
+      facility.descriptionEn,
+      facility.lat,
+      facility.lng,
+      facility.phone,
+      facility.emergencyPhone,
+      // Not named above: still in its trial, set by nobody yet.
+      AGREEMENTS[facility.slug]?.state ?? 'trial',
+      AGREEMENTS[facility.slug]?.note ?? null,
+      AGREEMENTS[facility.slug] === undefined
+        ? null
+        : new Date(
+            Date.parse(now) - (AGREEMENTS[facility.slug]?.daysAgo ?? 0) * 86_400_000,
+          ).toISOString(),
+    ]);
+
+    await insertRows(
+      client,
+      'hospitals',
+      {
+        columns: [
+          'code',
+          'name_bn',
+          'name_en',
+          'kind',
+          'division',
+          'district',
+          'thana',
+          'address_bn',
+          'address_en',
+          'description_bn',
+          'description_en',
+          'lat',
+          'lng',
+          'phone',
+          'emergency_phone',
+          'agreement_state',
+          'agreement_note',
+          'agreement_changed_at',
+          'is_live',
+          'lifecycle',
+          'onboarded_at',
+        ],
+        // Every demo facility is published and onboarded: an unverified
+        // facility never appears in search (`hospitals_live_requires_onboarding`),
+        // and a demo whose hospitals are invisible shows nothing.
+        //
+        // **Onboarded partway through the seeded history, not at seed time.**
+        // `FR-ADM-02` marks the live-queue adoption date on the wait-time
+        // trend, and the marker exists to answer one question — *did this
+        // change anything?* A facility onboarded this morning puts the line at
+        // the right-hand edge of the chart with nothing after it, which
+        // answers nothing. `seed_04_history` reaches back twenty-one days and
+        // runs its chambers closer to plan after this date, so the chart has a
+        // before and an after and the marker sits between them.
+        // Live, so the workspace is `active`: 0037 ties the two (`FR-ONB-02`).
+        expressions: {
+          is_live: 'true',
+          lifecycle: `'active'`,
+          onboarded_at: `now() - interval '12 days'`,
+        },
+      },
+      hospitalRows,
+      '',
+    );
+
+    const facilities = await facilityIds(client);
+
+    // --- staff_users and staff_roles ---------------------------------------
+    //
+    // Every demo account signs in with the one documented demo password at
+    // `S-B-00` (pilot step 21, `DEMO_STAFF_PASSWORD`); under `DEMO_MODE=true`
+    // the picker still opens any console without it. `totp_secret` stays
+    // null: 2FA is step 28.
+    const passwordHash = await demoPasswordHash();
+    const staffRows: unknown[][] = [];
+    const staffKeys: { slug: string; role: string; counter: number }[] = [];
+
+    for (const facility of DEMO_FACILITIES) {
+      const hospitalId = facilities.get(facility.slug);
+      if (hospitalId === undefined) throw new Error(`No id for ${facility.slug}.`);
+
+      const prefix = facilityPrefix(facility.slug);
+
+      for (const { role, count } of rosterFor(facility.kind)) {
+        for (let n = 1; n <= count; n += 1) {
+          const local = count === 1 ? role.replace('hospital_', '') : `${role}${String(n)}`;
+          const code = ROLE_CODES[role];
+          if (code === undefined) throw new Error(`No ID-card code for role ${role}.`);
+
+          staffRows.push([
+            hospitalId,
+            demoEmail(local, facility.slug),
+            `${prefix}-${code}-${String(n).padStart(2, '0')}`,
+            labelBn(composeName(names, names.chance(0.55) ? 'female' : 'male')),
+            passwordHash,
+          ]);
+          staffKeys.push({ slug: facility.slug, role, counter: n });
+        }
+      }
+    }
+
+    const staffIds = await insertRows<{ id: string }>(
+      client,
+      'staff_users',
+      {
+        columns: ['hospital_id', 'email', 'staff_code', 'full_name', 'password_hash'],
+      },
+      staffRows,
+    );
+
+    /** Facility slug → that facility's hospital_admin, for `created_by`. */
+    const admins = new Map<string, string>();
+    const roleRows: unknown[][] = [];
+
+    for (const [index, key] of staffKeys.entries()) {
+      const staffId = staffIds[index]?.id;
+      const hospitalId = facilities.get(key.slug);
+      if (staffId === undefined || hospitalId === undefined) {
+        throw new Error(`staff_users returned no id for ${key.slug}/${key.role}.`);
+      }
+      if (key.role === 'hospital_admin') admins.set(key.slug, staffId);
+
+      roleRows.push([
+        staffId,
+        hospitalId,
+        key.role,
+        JSON.stringify(
+          key.role === 'receptionist'
+            ? { ...DEMO_MARKER, counters: [`R${String(key.counter)}`] }
+            : DEMO_MARKER,
+        ),
+      ]);
+    }
+
+    // `FR-ROLE-02`: a staff member may hold several roles. The clinic's
+    // administrator also works the counter, which is how a four-person clinic
+    // actually runs — and it is the case a role check has to get right.
+    const clinicAdmin = admins.get('buriganga-clinic');
+    const clinicId = facilities.get('buriganga-clinic');
+    if (clinicAdmin !== undefined && clinicId !== undefined) {
+      roleRows.push([
+        clinicAdmin,
+        clinicId,
+        'receptionist',
+        JSON.stringify({ ...DEMO_MARKER, counters: ['R2'] }),
+      ]);
+    }
+
+    // --- the national accounts (step 20; V3.1) -----------------------------
+    //
+    // Two, each belonging to no facility (`FR-ROLE-01`, R10 and R11;
+    // migration 0024). The government viewer is what `S-B-13` is opened as.
+    // The platform administrator answers hospitals' requests to go live
+    // (`FR-ONB-04`, `S-B-12`) and is the actor on those audit rows, so it has
+    // to be a real row. Their own name stream, so adding them moved no
+    // hospital's staff names; the viewer is first, so adding the
+    // administrator did not move the viewer's.
+    const nationalNames = rng.stream('national-staff-names');
+    const nationalIds = await insertRows<{ id: string }>(
+      client,
+      'staff_users',
+      {
+        columns: ['hospital_id', 'email', 'staff_code', 'full_name', 'password_hash'],
+      },
+      [
+        [
+          null,
+          demoEmail('gov', 'national'),
+          'NAT-GOV-01',
+          labelBn(composeName(nationalNames, nationalNames.chance(0.5) ? 'female' : 'male')),
+          passwordHash,
+        ],
+        [
+          null,
+          demoEmail('platform', 'national'),
+          'NAT-PLT-01',
+          labelBn(composeName(nationalNames, nationalNames.chance(0.5) ? 'female' : 'male')),
+          passwordHash,
+        ],
+      ],
+    );
+    const nationalId = nationalIds[0]?.id;
+    if (nationalId === undefined) throw new Error('staff_users returned no id for gov_viewer.');
+    roleRows.push([nationalId, null, 'gov_viewer', JSON.stringify(DEMO_MARKER)]);
+
+    const platformId = nationalIds[1]?.id;
+    if (platformId === undefined) {
+      throw new Error('staff_users returned no id for platform_admin.');
+    }
+    roleRows.push([platformId, null, 'platform_admin', JSON.stringify(DEMO_MARKER)]);
+
+    await insertRows(
+      client,
+      'staff_roles',
+      { columns: ['staff_user_id', 'hospital_id', 'role', 'scope'] },
+      roleRows,
+      '',
+    );
+
+    // --- hospital_settings -------------------------------------------------
+    //
+    // `numeral_style` and `refund_policy` are set per facility. Every queue
+    // policy default is left alone deliberately: the defaults in migration
+    // 0004 are the values the requirements name (`FR-QUE-20`, `FR-QUE-21`,
+    // `FR-OFF-04`), and a seed that overrode them would demo behaviour the
+    // product does not have.
+    const settingsRows = DEMO_FACILITIES.map((facility) => {
+      const hospitalId = facilities.get(facility.slug);
+      if (hospitalId === undefined) throw new Error(`No id for ${facility.slug}.`);
+      return [
+        hospitalId,
+        facility.numeralStyle,
+        // `{}` where there is none: the column's CHECK requires an object,
+        // and an empty one is what `readRefundPolicy` reads as "no policy".
+        JSON.stringify(REFUND_POLICIES[facility.slug] ?? {}),
+        BRANDS[facility.slug] === undefined ? null : JSON.stringify(BRANDS[facility.slug]),
+        // A text array, written the way PostgreSQL reads one.
+        `{${(MODULES_OFF[facility.slug] ?? []).join(',')}}`,
+        `{${(UNPUBLISHED[facility.slug] ?? []).join(',')}}`,
+        ARRIVAL_WINDOWS.has(facility.slug),
+        admins.get(facility.slug) ?? null,
+      ];
+    });
+
+    await insertRows(
+      client,
+      'hospital_settings',
+      {
+        columns: [
+          'hospital_id',
+          'numeral_style',
+          'refund_policy',
+          'brand',
+          'modules_off',
+          'unpublished',
+          'arrival_windows',
+          'created_by',
+        ],
+      },
+      settingsRows,
+      '',
+    );
+
+    // --- hospital_logos ----------------------------------------------------
+    //
+    // A mark for each facility that has colours of its own (`FR-BRD-06`), in
+    // its main colour, so that the logo on a card, in the portal's header and
+    // on the settings screen is something to look at. The others have none,
+    // which is the ordinary state and the one a card has to look right in.
+    const logoRows: unknown[][] = [];
+    for (const facility of DEMO_FACILITIES) {
+      const brand = BRANDS[facility.slug];
+      const colour = brand?.colors['brand-600'];
+      const hospitalId = facilities.get(facility.slug);
+      if (colour === undefined || hospitalId === undefined) continue;
+      const bytes = markPng(colour);
+      logoRows.push([
+        hospitalId,
+        'image/png',
+        bytes,
+        createHash('sha256').update(bytes).digest('hex'),
+        admins.get(facility.slug) ?? null,
+      ]);
+    }
+    await insertRows(
+      client,
+      'hospital_logos',
+      { columns: ['hospital_id', 'content_type', 'bytes', 'sha256', 'created_by'] },
+      logoRows,
+      '',
+    );
+
+    // --- departments -------------------------------------------------------
+    const departmentRows: unknown[][] = [];
+    for (const facility of DEMO_FACILITIES) {
+      const hospitalId = facilities.get(facility.slug);
+      if (hospitalId === undefined) throw new Error(`No id for ${facility.slug}.`);
+
+      for (const [order, code] of facility.departments.entries()) {
+        const entry = specialty(code);
+        departmentRows.push([
+          hospitalId,
+          entry.nameBn,
+          entry.nameEn,
+          entry.code,
+          order,
+          admins.get(facility.slug) ?? null,
+        ]);
+      }
+    }
+
+    await insertRows(
+      client,
+      'departments',
+      {
+        columns: ['hospital_id', 'name_bn', 'name_en', 'code', 'sort_order', 'created_by'],
+      },
+      departmentRows,
+      '',
+    );
+
+    // --- capabilities ------------------------------------------------------
+    const capabilityRows: unknown[][] = [];
+    for (const facility of DEMO_FACILITIES) {
+      const hospitalId = facilities.get(facility.slug);
+      if (hospitalId === undefined) throw new Error(`No id for ${facility.slug}.`);
+
+      const ageMinutes = CAPABILITY_AGE_MINUTES[facility.slug] ?? 5;
+      const confirmedAt = new Date(Date.parse(now) - ageMinutes * 60_000).toISOString();
+
+      for (const kind of facility.capabilities) {
+        const unavailable = UNAVAILABLE.some(
+          (entry) => entry.hospitalSlug === facility.slug && entry.kind === kind,
+        );
+        capabilityRows.push([
+          hospitalId,
+          kind,
+          !unavailable,
+          // Whoever confirmed it: the emergency desk where there is one, the
+          // administrator otherwise. `capabilities.updated_by` is read by the
+          // freshness line a patient sees, so it is not decoration.
+          admins.get(facility.slug) ?? null,
+          confirmedAt,
+          confirmedAt,
+        ]);
+      }
+    }
+
+    await insertRows(
+      client,
+      'capabilities',
+      {
+        columns: ['hospital_id', 'kind', 'is_available', 'updated_by', 'created_at', 'updated_at'],
+      },
+      capabilityRows,
+      '',
+    );
+
+    // --- audit_log: each workspace's trail of changes -----------------------
+    //
+    // What a platform administrator reads on a workspace (`FR-ONB-07`,
+    // `LIST-B12-TRAIL`): how the hospital was brought on. The platform made
+    // the workspace; the hospital's administrator set it up and asked for
+    // review; the platform verified a doctor and approved it, twelve days ago,
+    // which is `onboarded_at` above. Then whatever the tables above say was
+    // set afterwards: a module switched off, a figure kept back, an agreement
+    // recorded. Organisational changes only, as every row of this trail is:
+    // nothing here names a patient.
+    const minute = 60_000;
+    const day = 24 * 60 * minute;
+    const at = (daysAgo: number, minutesLater = 0): string =>
+      new Date(Date.parse(now) - daysAgo * day + minutesLater * minute).toISOString();
+
+    const trailRows: unknown[][] = [];
+    for (const facility of DEMO_FACILITIES) {
+      const hospitalId = facilities.get(facility.slug);
+      const adminId = admins.get(facility.slug) ?? null;
+      if (hospitalId === undefined) throw new Error(`No id for ${facility.slug}.`);
+
+      const steps: [string, string | null, string, string][] = [
+        ['workspace_created', platformId, 'hospitals', at(14)],
+        ['profile', adminId, 'hospitals', at(13, 20)],
+        ['department_added', adminId, 'departments', at(13, 32)],
+        ['doctor_added', adminId, 'doctor_hospitals', at(13, 47)],
+        ['schedule_added', adminId, 'session_templates', at(13, 58)],
+        ['staff_added', adminId, 'staff_users', at(13, 75)],
+        ...(facility.capabilities.length > 0
+          ? [
+              ['capabilities_declared', adminId, 'capabilities', at(13, 90)] as [
+                string,
+                string | null,
+                string,
+                string,
+              ],
+            ]
+          : []),
+        ['review_requested', adminId, 'hospitals', at(12, -180)],
+        ['doctor_verified', platformId, 'doctors', at(12, -45)],
+        ['workspace_approve', platformId, 'hospitals', at(12)],
+      ];
+      if ((MODULES_OFF[facility.slug] ?? []).length > 0) {
+        steps.push(['modules', platformId, 'hospital_settings', at(12, 10)]);
+      }
+      if ((UNPUBLISHED[facility.slug] ?? []).length > 0) {
+        steps.push(['publishing', adminId, 'hospital_settings', at(9, 30)]);
+      }
+      const agreement = AGREEMENTS[facility.slug];
+      if (agreement !== undefined) {
+        steps.push([
+          `agreement_${agreement.state}`,
+          platformId,
+          'hospitals',
+          at(agreement.daysAgo),
+        ]);
+      }
+
+      for (const [change, actor, table, when] of steps) {
+        trailRows.push([
+          actor,
+          hospitalId,
+          'SETTINGS_CHANGE',
+          table,
+          hospitalId,
+          JSON.stringify({ change, ...DEMO_MARKER }),
+          when,
+        ]);
+      }
+    }
+
+    await insertRows(
+      client,
+      'audit_log',
+      {
+        columns: [
+          'actor_staff_id',
+          'hospital_id',
+          'action',
+          'subject_table',
+          'subject_id',
+          'meta',
+          'created_at',
+        ],
+      },
+      trailRows,
+      '',
+    );
+
+    log(
+      `      burn units: ${DEMO_FACILITIES.filter((f) => f.capabilities.includes('burn_unit'))
+        .map((f) => f.nameEn)
+        .join(', ')}`,
+    );
+
+    return {
+      hospitals: hospitalRows.length,
+      hospital_settings: settingsRows.length,
+      departments: departmentRows.length,
+      capabilities: capabilityRows.length,
+      staff_users: staffRows.length + nationalIds.length,
+      staff_roles: roleRows.length,
+    };
+  },
+};
+
+/** Three letters for an ID card, derived from the slug so it cannot drift. */
+function facilityPrefix(slug: string): string {
+  const first = slug.split('-')[0] ?? slug;
+  return first.slice(0, 3).toUpperCase();
+}

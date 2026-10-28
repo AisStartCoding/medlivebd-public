@@ -1,0 +1,18 @@
+{
+  "name": "@platform/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Typed API client, realtime session channel and the offline event queue used by the web apps (FRONTEND.md §11).",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.js",
+    "./api": "./src/api/client.js"
+  },
+  "scripts": {},
+  "dependencies": {
+    "@platform/domain": "workspace:*",
+    "dexie": "^4.4.6",
+    "socket.io-client": "^4.8.3"
+  }
+}

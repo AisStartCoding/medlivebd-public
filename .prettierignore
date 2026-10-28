@@ -1,0 +1,31 @@
+node_modules/
+.local/
+dist/
+build/
+.next/
+out/
+coverage/
+playwright-report/
+test-results/
+pnpm-lock.yaml
+
+# The five source-of-truth documents are hand-formatted; Prettier would reflow
+# their tables and diff noise would bury real changes (CLAUDE.md §2).
+docs/
+CLAUDE.md
+
+# Migrations are read as SQL, not as Prettier output. (These said `db/` until
+# step 16 — a directory this repository has never had, so the rule matched
+# nothing. Prettier ships no SQL parser, which is why nothing broke.)
+database/migrations/
+database/docker/
+
+# Written by Next on every build, and the file itself says it should not be
+# edited. Formatting it means a diff that reappears the next time anyone runs
+# `pnpm dev`.
+next-env.d.ts
+
+# The Django API's virtualenv, test caches and generated parity vectors.
+backend/django/.venv
+backend/django/.pytest_cache
+backend/django/tests/parity/vectors

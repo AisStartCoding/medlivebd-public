@@ -1,0 +1,1284 @@
+# App & Web Flow Document
+## National Healthcare Platform — Bangladesh
+
+**Document:** `APP_FLOW.md` — 2 of 4 (`PRD.md`, **`APP_FLOW.md`**, `FRONTEND.md`, `BACKEND.md`)
+**Version:** 1.0
+**Depends on:** `PRD.md` (requirement IDs referenced throughout as `FR-XXX-NN`)
+**Purpose:** every screen, every control, what each control is wired to, what happens after the tap, and what the user sees in success, failure, empty, loading, and offline states.
+
+---
+
+## 0. How to read this document
+
+### 0.1 Two products, one system
+
+| Product | Surface | Who | Delivery |
+|---|---|---|---|
+| **Part A — Public** | Mobile-first PWA (installable) | Patients, attendants, anyone in an emergency | `app.[domain]` — phone-sized, works on desktop but designed for phones |
+| **Part B — Hospital** | Desktop web console | Receptionists, doctors, ward staff, ER coordinators, lab, pharmacy, admins | `console.[domain]` — monitor-sized, keyboard-first, **never shown in the patient app** |
+| **Part C — Marketing site** | Public website | Hospital decision-makers, press, patients discovering the product | `[domain]` — the front door, with the two entrances |
+
+**Rule:** the patient app contains no hospital login, no staff entry point, no "are you a hospital?" link other than a single footer link that opens the marketing site. Staff reach the console only from the marketing site or a direct URL.
+
+### 0.2 ID conventions
+
+| Prefix | Meaning | Example |
+|---|---|---|
+| `S-A-##` | Public app screen | `S-A-08` Live Serial |
+| `S-B-##` | Hospital console screen | `S-B-02` Reception Queue |
+| `S-C-##` | Marketing site page | `S-C-01` Home |
+| `BTN-*` | A control | `BTN-A08-LATE` |
+| `MOD-*` | Modal / bottom sheet | `MOD-A08-LATE` |
+| `EVT-*` | Domain event written to the log | `EVT-PATIENT_CALLED` |
+
+### 0.3 Wiring notation
+
+Every control row reads:
+
+**Trigger → Optimistic UI → Call → Server effect → Broadcast → Result UI → Failure UI**
+
+- **Optimistic UI**: what changes instantly before the server answers (required for all console actions, `FR-OFF-01`).
+- **Broadcast**: which realtime channel receives the change and who is listening.
+- **Failure UI**: what the user sees when the call fails — never a silent failure, never a spinner that never resolves.
+
+### 0.4 Global interaction rules
+
+- `GR-01` Every destructive action (cancel booking, mark no-show, discharge, decline referral) requires a confirm step. Confirm text names the consequence, not "are you sure".
+- `GR-02` Every console queue action gets a 10-second **undo** toast.
+- `GR-03` Every screen has four defined states: loading (skeleton), empty, error (with retry), offline (with staleness banner).
+- `GR-04` Nothing blocks on the network: console writes go to the local queue first.
+- `GR-05` Every live number is rendered with its freshness line.
+- `GR-06` Bangla is the default language everywhere; English is a toggle (`FR-LOC-01`). The toggle is at the top of every screen of both apps — `SEG-A00-LANG` above every patient screen, `SEG-B00-LANG` in every console's header — and switches every screen at once, without a reload (`FRONTEND.md` `I18N-08`).
+- `GR-07` Emergency is always reachable: it is the first element of the app home and a persistent item in the app's navigation.
+- `GR-08` No screen requires login. Emergency search, hospital browse, and doctor browse are fully open (`FR-PAT-40`); booking, payments, bed requests, ambulance, and blood are available to **guests** with phone + name (`FR-GST-01`). Only the multi-device wallet and saved profiles require an account. All console screens require staff login.
+
+---
+
+# PART A — PUBLIC APP (patients)
+
+## A0. Entry and first run
+
+### `S-A-00` Splash / boot
+
+| Element | ID | Behaviour |
+|---|---|---|
+| Logo + tagline | — | Shown ≤ 1.5 s while the app checks session token and cached data |
+| Silent checks | — | (1) valid token? (2) cached hospitals? (3) network? |
+
+**Routing after boot**
+- Token valid → `S-A-02` Home.
+- No token, first ever launch → `S-A-01` Language.
+- No token, returning → `S-A-02` Home in guest mode (browse + emergency allowed).
+
+### `S-A-01` Language & location
+
+| Element | ID | Type | Wiring |
+|---|---|---|---|
+| বাংলা | `BTN-A01-BN` | Big choice card | Sets locale `bn` → persists local → `S-A-01b` |
+| English | `BTN-A01-EN` | Big choice card | Sets locale `en` → persists local → `S-A-01b` |
+
+`S-A-01b` Location permission
+
+| Element | ID | Wiring |
+|---|---|---|
+| অনুমতি দিন (Allow) | `BTN-A01-LOC-YES` | Requests OS permission → on grant store coords → `S-A-02` |
+| এখন নয় (Not now) | `BTN-A01-LOC-NO` | Skips → `S-A-02`, distance features fall back to manual area picker |
+
+**Failure:** permission denied permanently → area picker (`MOD-A02-AREA`) is used wherever distance is needed; never ask again automatically.
+
+---
+
+## A1. Authentication and profiles
+
+### `S-A-03` Phone entry (`FR-PAT-01`)
+
+| Element | ID | Type | Wiring |
+|---|---|---|---|
+| Phone field | `INP-A03-PHONE` | numeric input, +880 prefix fixed | Validates 11-digit BD mobile pattern; inline error below field |
+| কোড পাঠান (Send code) | `BTN-A03-SEND` | primary, disabled until valid | → `POST /auth/otp` → success: `S-A-04` with 60 s resend timer; failure: inline error + retry |
+| Trouble link | `BTN-A03-HELP` | text link | Opens help sheet: what the OTP is for, support number |
+
+**Rate limiting UI:** after 3 sends in 10 minutes, the button disables with a countdown and an explanation (`FR-SEC-05`).
+
+### `S-A-04` OTP verify
+
+| Element | ID | Wiring |
+|---|---|---|
+| 6-digit input | `INP-A04-OTP` | Auto-advance, auto-submit on 6th digit, SMS autofill where available |
+| যাচাই করুন | `BTN-A04-VERIFY` | → `POST /auth/verify` → **new user** → `S-A-05` profile creation; **returning** → `S-A-02` Home |
+| আবার পাঠান | `BTN-A04-RESEND` | Disabled during countdown; re-issues OTP |
+| নম্বর বদলান | `BTN-A04-EDIT` | Back to `S-A-03` |
+
+**Failures:** wrong code → shake + inline "কোড মেলেনি"; expired → offer resend; 5 wrong attempts → lock 15 min with countdown.
+
+> **Built in pilot step 25, on the Profile tab** (`/profile`), not as a first-launch wall: the app never asks for a sign-in before it is useful (`FR-GST-01`). `S-A-03` and `S-A-04` are one screen in two stages; the six boxes auto-submit. On a demonstration the code is also shown under the boxes ("ডেমো: …"). After verifying, `S-A-20` opens when the number holds anything to claim; otherwise the account's profiles, each with its records. `S-A-05` (creating a profile by hand) and `S-A-06` are not built: in this version a profile comes from a booking or a claim.
+
+### `S-A-05` Create first profile (`FR-PAT-02`)
+
+Progressive disclosure: one question per screen-block, all required fields visible in one scroll.
+
+| Field | ID | Required | Notes |
+|---|---|---|---|
+| নাম | `INP-A05-NAME` | yes | Bangla or English input |
+| বয়স / জন্মতারিখ | `INP-A05-AGE` | yes | Age in years or full DOB toggle |
+| লিঙ্গ | `SEG-A05-SEX` | yes | Segmented: পুরুষ / নারী / অন্যান্য |
+| রক্তের গ্রুপ | `SEL-A05-BLOOD` | no | Dropdown, "জানি না" allowed |
+| এনআইডি | `INP-A05-NID` | no | For future health-ID linkage |
+
+| Control | ID | Wiring |
+|---|---|---|
+| সংরক্ষণ করুন | `BTN-A05-SAVE` | → `POST /profiles` → set as active profile → `S-A-02` |
+| পরে করব | `BTN-A05-SKIP` | Allowed; booking later forces profile creation inline |
+
+### `S-A-06` Profile switcher (`MOD`)
+
+Opened from the avatar on Home or from any booking step.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Profile rows | `ROW-A06-<id>` | Tap sets active profile → sheet closes → current screen re-renders for that profile |
+| + নতুন প্রোফাইল | `BTN-A06-ADD` | → `S-A-05` in "add" mode (self / mother / father / child / other relationship selector) |
+| প্রোফাইল ব্যবস্থাপনা | `BTN-A06-MANAGE` | → `S-A-19` Profiles settings |
+
+**Rule:** the active profile is shown persistently in the app header, because booking for the wrong person is the classic failure (`FR-PAT-03`).
+
+---
+
+## A1.5 Guest path (no account) — `FR-GST`
+
+Guest is a full path, not a downgrade. The app never shows a login wall; it shows a **shorter form**.
+
+### `MOD-A07-GUEST` Guest details sheet
+
+Opened automatically at the confirm step (`S-A-07c`) when no session token exists. Same sheet is reused by bed request, ambulance, diagnostics, and blood.
+
+| Field | ID | Required | Notes |
+|---|---|---|---|
+| রোগীর নাম | `INP-GST-NAME` | yes | |
+| মোবাইল নম্বর | `INP-GST-PHONE` | yes | Serial updates and receipt go here |
+| বয়স | `INP-GST-AGE` | yes for bookings | Not asked for emergency or ambulance |
+| লিঙ্গ | `SEG-GST-SEX` | yes for bookings | |
+| আমার জন্য / অন্য কারও জন্য | `SEG-GST-FOR` | no | Only changes the label wording |
+
+| Control | ID | Wiring |
+|---|---|---|
+| এগিয়ে যান | `BTN-GST-NEXT` | If this phone has booked before → prefilled details shown for one-tap confirm (`FR-GST-12`). Else → `MOD-GST-OTP`. "This phone" is the device: it holds the proof `/guest/verify` gave it for the number, and the number typed on any other device is sent a code (decision 85) |
+| অ্যাকাউন্ট আছে? লগ ইন | `BTN-GST-LOGIN` | Optional escape hatch → `S-A-03`, returns to the same step afterwards |
+
+### `MOD-GST-OTP` One-time phone check
+
+Shown only when money or an SMS thread follows (`FR-GST-03`). Not shown for emergency actions.
+
+| Control | ID | Wiring |
+|---|---|---|
+| 6-digit input | `INP-GST-OTP` | Auto-submit; SMS autofill |
+| যাচাই করুন | `BTN-GST-VERIFY` | → `POST /guest/verify` → returns a **guest token** bound to phone + device. Creates no account, asks nothing further (`FR-GST-04`) |
+
+> **Built in pilot step 25** on the confirm step: **সিরিয়াল নিন** first asks `POST /guest/start`; a new number gets the six boxes inline, then the booking goes with the guest token. On a demonstration (`GUEST_BOOKING_OTP` unset with `DEMO_MODE`) nothing is asked, as before.
+
+### Guest booking completion
+
+1. `BTN-A07C-CONFIRM` runs the normal booking chain with the guest token in place of a user token.
+2. Server creates a **guest identity** keyed by phone, and a patient record attached to it.
+3. SMS is sent containing: hospital, doctor, serial, expected window, and a **tracking link** (`FR-GST-05`).
+4. Tapping the tracking link opens `S-A-08` Live Serial in guest mode — identical screen, identical live updates, including the late, reschedule, and cancel controls.
+5. `S-A-07d` success screen shows one soft offer: `BTN-A07D-SAVEACC` — "সব রেকর্ড এক জায়গায় রাখুন" → `S-A-05`. Dismissable, never repeated in that session (`FR-GST-11`).
+
+### Guest live serial differences
+
+| Aspect | Account | Guest |
+|---|---|---|
+| Live screen | Same | Same, opened from the SMS link or the device that booked |
+| Push notifications | Yes | Yes if the PWA is installed; SMS always |
+| Late / reschedule / cancel | Yes | Yes |
+| Records after the visit | In wallet | Downloadable from the tracking link for a limited period, and held against the phone for later claiming (`FR-GST-08`) |
+| Multi-device access | Yes | Only via the SMS link |
+
+### `S-A-20` Claim your history (`FR-GST-09`)
+
+Triggered automatically after an account is created with a phone that has guest activity.
+
+| Element | ID | Wiring |
+|---|---|---|
+| List of past bookings and records | — | Read-only preview |
+| যোগ করুন | `BTN-A20-CLAIM` | Links all guest records to the new account under a chosen profile; one confirmation, no re-entry of any detail |
+
+> **Built in pilot step 25.** Lists each patient with their serial and record counts, and names the hospital for one a hospital imported (`FR-IMP-10`). **যোগ করুন** takes them all; **এখন না** leaves them to be claimed at the next sign-in.
+| না, থাক | `BTN-A20-SKIP` | Leaves them unlinked; offer reappears in settings |
+
+### Guest in emergency (`FR-GST-03`)
+
+`S-A-10`, `S-A-10b`, `S-A-10c` require **nothing at all** — no name, no phone, no OTP.
+`BTN-A10-ONWAY` optionally offers a phone field so the ER can call back; leaving it blank still sends the inbound alert.
+`BTN-A10-AMB` (ambulance) asks name + phone in `MOD-A07-GUEST`, with OTP because a fare and a driver are involved.
+
+---
+
+## A2. Home
+
+### `S-A-02` Home
+
+Rebuilt on 2026-10-07 to **Visual Direction 2** (`FRONTEND.md` §0.5; the approved board is `docs/design/patient-direction-2.png`). The order is fixed: **the header; what you came for; one way to ask; the three main actions; three services.** Before that day the order was the 5 October one (search, then the emergency card, then specialties, then tiles); what moved and where is listed under the table.
+
+1. The header: the official logo (a hospital's mark and name in its own app), the বাংলা | EN switch and the profile.
+2. If this phone holds a current serial, the live serial card. Otherwise the welcome card: a two-line headline, one line, and the family illustration.
+3. The search field.
+4. Three main actions in one row: ডাক্তার খুঁজুন, আমার লাইভ সিরিয়াল, জরুরি সহায়তা.
+5. অন্যান্য সেবা: hospital beds, medicines, health records.
+
+| Element | ID | Type | Wiring |
+|---|---|---|---|
+| Language switch | `SEG-A00-LANG` | two buttons, বাংলা / EN, in the header of every screen | Sets the locale for every screen at once, no reload → stored on the device (`FRONTEND.md` `I18N-08`) |
+| Logo | `app-name` | the official logo (`FRONTEND.md` §0.5); the hospital's mark and name inside its own app | — |
+| Avatar | `BTN-A02-PROFILE` | icon button | → `S-A-19` |
+| Welcome card | — | headline, one line, the family illustration (decorative) | Shown only when there is no current serial |
+| **Active serial card** | `BTN-A02-ACTIVE` | in the welcome card's place while this device holds a *current* booking (`FR-PAT-39`): unresolved, in a session that has not ended, whatever its date. When that cannot be checked it stays and says the status is unknown, with its age | → `S-A-08` Live serial. Shows the live position |
+| Search field | `BTN-A02-SEARCH` | a link drawn as a field | → `S-A-07s`, ready to type |
+| ডাক্তার খুঁজুন | `BTN-A02-DOCTOR` | main tile | → `S-A-07s` |
+| আমার লাইভ সিরিয়াল | `BTN-A02-SERIAL` | main tile | → the current serial's `S-A-08` when there is one, otherwise `S-A-09` |
+| **জরুরি সহায়তা** | `BTN-A02-EMERGENCY` | main tile, the red one (`FRONTEND.md` §6.3) | → `S-A-10` Emergency triage. **No auth check** |
+| হাসপাতালের বেড | `BTN-A02-BED` | service tile | → `S-A-11`. Not offered in a hospital's app where it runs no ward |
+| ওষুধ খুঁজুন | `BTN-A02-MED` | service tile | → `S-A-14`'s medicine search. Not offered where the hospital runs no pharmacy or keeps its shelf |
+| স্বাস্থ্য রেকর্ড | `BTN-A02-REPORT` | service tile | → `S-A-12` |
+| Bottom nav | `NAV-A` | হোম / খুঁজুন / সিরিয়াল / রেকর্ড / আরও | Tabs → `S-A-02`, `S-A-07s`, `S-A-09`, `S-A-12`, `S-A-19`. One component, identical on every screen |
+
+**Moved on 2026-10-07, not removed.** The quick-need chips (`CHIP-A02-NEED-<key>`) and the specialty grid (`BTN-A02-SPEC-<code>`) are on `S-A-07s`, which shows every need on arrival; home keeps one way to ask. Ambulance and blood stay outside V1 (`PRD.md` §7.8).
+
+**States**
+- Guest: everything visible; tapping anything that needs auth opens `S-A-03` with a return-to intent.
+- No location: area picker chip replaces distances.
+- Offline: cached hospital list with a staleness banner; emergency card still works and says data may be stale.
+
+---
+
+## A3. Finding care
+
+### `S-A-07s` Search — what do you need? (`FR-PAT-16`–`18`)
+
+Added 2026-10-05. The screen the network's case rests on: a patient says what they need and sees which participating hospitals can provide it now. Public, no sign-in (`FR-GST-01`). Route `/search`; its address carries what is asked (`?q=…&need=…`), so a result can be reloaded and sent to somebody.
+
+A **need** is one of the three things hospitals publish live: a specialty, a bed kind, an emergency capability (`shared/domain` `search/needs`). Only those are offered. Blood bank and ambulance are not offered as needs, because both read as the services that are outside V1.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Search field | `INP-A07S-Q` | Focused on arrival. Typing rests 300 ms, then `GET /search?q=`. Matches doctor and hospital names in Bangla and English; text that is a name for a need ("ICU", "আইসিইউ", "burn") is answered as that need, and any hospital or doctor whose name contains the word is listed after |
+| Need offered while typing | `CHIP-A07S-SUGGEST-<key>` | Shown when what is typed starts a need's name (two letters at least). Tap → that need is chosen and the field is cleared |
+| Need groups | `CHIP-A07S-NEED-<key>` | Shown while nothing is asked: ডাক্তার দেখান (the eight specialties), বেড ও আইসিইউ (ICU, CCU, NICU, HDU, cabin, general, burn), বিশেষ সেবা (burn unit, cardiac, cath lab, stroke, dialysis, trauma OT, isolation). Tap → `GET /search?need=<key>` at once |
+| Chosen need | `CHIP-A07S-CHOSEN` + `BTN-A07S-CHANGE` | The need being answered, and বদলান to drop it. With a need chosen, typed text narrows the hospitals by name |
+| Hospital result | `CARD-A07S-<hospitalId>` | Name and address, then **the figure that answers what was asked, first, with its age**: for a specialty, doctors here, sitting now and serials open today; for a bed kind, free and total of that kind and when the ward confirmed it, or "the count has not been confirmed" (`PRD.md` §3.2); for a capability, that it is there and when that was confirmed. Free beds and ICU follow, except on a bed search |
+| Its action | `BTN-A07S-OPEN-<hospitalId>` | Specialty → `S-A-05h` at that hospital in that specialty (`/book?specialty=&hospital=`). Bed kind → `S-A-11` opened on that kind. Capability or a name → every doctor at that hospital (`/book?hospital=`) |
+| Call | `BTN-A07S-CALL-<hospitalId>` | On a capability result only: `tel:` the hospital's emergency number, or its switchboard. A capability is an emergency's question |
+| Doctor result | `CARD-A07S-DOC-<doctorId>` | Name and degrees, then each chamber: hospital, specialty, fee → `S-A-07b` for that doctor at that hospital (`/book?specialty=&hospital=&doctor=`). Listed for typed text and for a specialty; not for a bed or a capability |
+
+**Presentation (Visual Direction 2, 2026-10-07).** The screen is titled ডাক্তার খুঁজুন and is the খুঁজুন tab. On arrival the eight specialties are one row of chips first, then beds and special care. When an answer holds both doctors and hospitals, a two-way switch (`TAB-A07S-DOCTORS` ডাক্তার · n / `TAB-A07S-HOSPITALS` হাসপাতাল · n) shows one list at a time: doctors first for a specialty or a name, hospitals first for a bed or a capability. A doctor is a card with a letter avatar, degrees, each chamber's hospital and fee, and সিরিয়াল নিন; never a photo, never a rating.
+
+**Order.** A specialty or a capability: nearest first when a position is known, then who is sitting now. A bed kind: most free first; a hospital that has never confirmed that kind last.
+
+**States (`GR-03`)**
+- Loading: two blocks the shape of a result.
+- Nothing found: for a name, "‘…’ নামে কোনো ডাক্তার বা হাসপাতাল পাওয়া যায়নি"; for a need, that no participating hospital reports it right now.
+- Failed: says the search could not be completed, with আবার খুঁজুন. Never the empty state's words.
+- Offline: says searching needs a connection; the needs stay on screen.
+
+**In a hospital's own app (`FR-PAT-19`, `FR-BRD-02`).** Home's live-serial strip and `S-A-09` list only the serials this phone booked at that hospital; a serial at another hospital is still there in the network's own app. The patient app has a *hospital scope*: unset, it is the network; set to a hospital's code, every discovery call carries it and the app is that hospital's. The header carries the hospital's name instead of the platform's, the search lines name it, results and the booking flow hold that hospital only, another hospital cannot be found by name, and the brand tokens are the hospital's if it has set readable ones (`FRONTEND.md` §1.1, `DATABASE.md` `hospital_settings.brand`). A scope comes from the build (`NEXT_PUBLIC_HOSPITAL_SCOPE`, which the address bar cannot undo) or from `?scope=CODE` on any address, kept for the visit; `?scope=` leaves it. The emergency screens are not narrowed. Built as a foundation only: no store build, no logo, no custom domain (`FR-BRD-05`).
+
+**Not built:** `FR-PAT-15`'s tolerance of misspellings (matching is the text as typed, `FR-PAT-18`); sorting by distance from the patient (no position is asked for outside the emergency search); a hospital's own page (`S-A-05h`'s header and tabs — a hospital result opens its doctors).
+
+### `S-A-07` Specialty results (hospitals offering it)
+
+| Element | ID | Wiring |
+|---|---|---|
+| Back | `BTN-A07-BACK` | → previous screen |
+| Filter chips | `CHIP-A07-NEAR` / `-WAIT` / `-FEE` / `-OPEN` | Client-side re-sort: distance / current wait / fee / sitting now. Selected chip is single-select except `-OPEN` which is a toggle |
+| Search field | `INP-A07-SEARCH` | Filters by hospital or doctor name, Bangla + English (`FR-PAT-15`) |
+| Hospital card | `CARD-A07-<hospitalId>` | → `S-A-05h` Hospital detail. Shows: name, area, distance, travel time, doctor count, live wait, free beds, ICU, freshness (`FR-PAT-14`) |
+| Empty state | — | "এই এলাকায় এখন কেউ বসছেন না" + button to widen area |
+
+### `S-A-05h` Hospital detail
+
+| Element | ID | Wiring |
+|---|---|---|
+| Header stats | — | Free beds / ICU / ER wait, each with freshness (`FR-PAT-14`) |
+| Tab: ডাক্তার | `TAB-A05H-DOC` | Doctor list (default) |
+| Tab: বেড | `TAB-A05H-BED` | Bed types, counts, nightly price, request button |
+| Tab: টেস্ট | `TAB-A05H-LAB` | Test catalogue + prices → `S-A-13` |
+| Tab: জরুরি | `TAB-A05H-ER` | ER capabilities, current load, directions |
+| Doctor row | `CARD-A05H-<doctorId>` | → `S-A-06d` Doctor detail |
+| সিরিয়াল নিন (on row) | `BTN-A05H-BOOK-<doctorId>` | Fast path: skips doctor detail → `S-A-07b` Session picker |
+| দিকনির্দেশ | `BTN-A05H-DIRECTIONS` | Opens the device map app with hospital coordinates |
+| কল করুন | `BTN-A05H-CALL` | Dials hospital number |
+
+### `S-A-06d` Doctor detail
+
+| Element | ID | Wiring |
+|---|---|---|
+| Live status pill | — | চেম্বারে আছেন · এখন চলছে #12 / আসবেন ৫:০০ / আজ বসবেন না (`FR-PAT-13`), subscribed to the session channel while open |
+| Chamber schedule list | `LIST-A06D-SESSIONS` | Rows per session: day, time, hospital, serials left |
+| সিরিয়াল নিন | `BTN-A06D-BOOK` | → `S-A-07b` Session picker |
+| স্ট্যান্ডবাই তালিকায় নাম দিন | `BTN-A06D-STANDBY` | Visible only when a session is full, beneath its card → `MOD-A06D-STANDBY` → where the deployment asks, `POST /guest/start` and `MOD-GST-OTP` inline, as the booking's confirm does (`FR-GST-03`) → `POST /sessions/:id/standby` → `S-A-08s` (`FR-PAT-25`) |
+| রোগীদের মতামত | `SEC-A06D-FEEDBACK` | Aggregate ratings, shown only above the volume threshold (`FR-PAT-83`) |
+
+---
+
+## A4. Booking
+
+### `S-A-07b` Session picker
+
+**Presentation (2026-10-07).** The doctor's card heads the screen: letter avatar, name, degrees, specialty and hospital, the live status pill (`FR-PAT-13`) with its age, and the fee. Then চেম্বার বেছে নিন: each session a row with its day, its hours and room, and the serials left. Tapping a row goes straight to confirm (`S-A-07c`); a full one offers standby beneath it.
+
+
+| Element | ID | Wiring |
+|---|---|---|
+| Date strip | `SEG-A07B-DATE` | Next 7 days; disabled days are greyed with a reason |
+| Session card | `CARD-A07B-<sessionId>` | Shows planned window, serials taken/total, expected wait; select highlights |
+| এগিয়ে যান | `BTN-A07B-NEXT` | → `S-A-07c` Confirm |
+
+### `S-A-07c` Confirm booking
+
+| Element | ID | Wiring |
+|---|---|---|
+| Profile selector | `BTN-A07C-PROFILE` | Logged in: opens `S-A-06`, defaults to active profile (`FR-PAT-03`). No account: opens `MOD-A07-GUEST` guest details sheet (`FR-GST-02`). **As built (plan F1), `MOD-A07-PROFILE`:** signed in, with at least one profile, the confirm step shows **কার জন্য সিরিয়াল?** and the account's profiles as buttons (name, age), the primary one chosen; no name, number or age is asked for and no code is sent (`FR-GST-10`) → `POST /bookings` with `patientId` and the account's token → the same success screen, with its link to the live serial. **অন্য কারও জন্য বুক করুন** opens the guest sheet for somebody who is not one of the profiles, and **আমার প্রোফাইল থেকে বেছে নিন** returns. Signed in with no profile yet, the profiles unreadable, or offline: the guest sheet, never a wall (`FR-GST-11`). `S-A-06` as a screen of its own, and adding a profile by hand (`FR-PAT-02`), are not built |
+| Preferred hour (optional) | `CHIP-A07C-WINDOW` | Only where the hospital offers it (`FR-PAT-28`, plan R1; `offersArrivalWindow` on the session): কখন আসতে চান (ঐচ্ছিক), যেকোনো সময় first and chosen, then each hour of the chamber. Beneath, always: a preference, not a set time; the live serial says when to set off. Sent as `arrivalWindowStart`; shown on `S-A-07d` |
+| Reason field (optional) | `INP-A07C-REASON` | Free text, feeds the doctor's pre-visit summary (`FR-DOC-03`) |
+| Pre-visit questions | `BTN-A07C-INTAKE` | Opens `MOD-A07-INTAKE`: 4–6 progressive questions (duration, main symptom, chronic conditions, current medicines, allergies) |
+| Fee breakdown | — | Consultation + platform fee + total + due at hospital (`FR-PAT-21`) |
+| Payment method | `SEG-A07C-PAY` | bKash / Nagad / card / হাসপাতালে দেব. **Only the methods this deployment can take** (`GET /config` `paymentMethods`; plan H3): card is offered only where a card provider is configured, which no live deployment is yet. হাসপাতালে দেব is not offered for a booking that must be paid first (`FR-PAY-02`, `FR-GST-14`), and the step says why |
+| নিশ্চিত করুন | `BTN-A07C-CONFIRM` | → `POST /bookings` (idempotency key) → payment sheet if prepaid → on success `S-A-07d` |
+
+**Wiring detail for `BTN-A07C-CONFIRM`**
+1. Optimistic: button shows inline spinner, screen locks (this is the one place a blocking wait is acceptable, because money).
+2. Call: create booking → returns serial number + session.
+3. Server effect: `EVT-BOOKING_CREATED`, SMS + push queued (`FR-NOT-03`).
+4. Broadcast: session channel gains a subscriber; reception console queue list updates live.
+5. Result: `S-A-07d` success screen.
+6. Failure: payment failed → stay on screen, error banner, booking not created; slot taken meanwhile → offer next available serial or standby.
+
+### `S-A-07d` Booking success
+
+| Element | ID | Wiring |
+|---|---|---|
+| Serial number (large) | — | Plus doctor, hospital, date, expected window, and the preferred hour when one was chosen, labelled as a preference (`FR-PAT-28`) |
+| লাইভ সিরিয়াল দেখুন | `BTN-A07D-LIVE` | → `S-A-08` |
+| ক্যালেন্ডারে যোগ | `BTN-A07D-CAL` | Device calendar event |
+| শেয়ার করুন | `BTN-A07D-SHARE` | Share sheet with a text summary (families coordinate over WhatsApp/Messenger) |
+| হোমে ফিরুন | `BTN-A07D-HOME` | → `S-A-02` |
+
+**Held, waiting for payment (`FR-PAY-08`; plan H3).** When `POST /bookings`
+answers with a payment that is `pending` and a `redirectUrl` (a provider that
+does not settle on the spot), the success screen shows the serial as **held**,
+not confirmed:
+
+| Element | ID | Wiring |
+|---|---|---|
+| Hold card | `CARD-A07D-HOLD` | সিরিয়াল N রাখা হয়েছে · ১৪ মিনিটের মধ্যে পরিশোধ করুন, counting down to `payment.holdUntil` by the server's clock. What happens if it runs out is said here, before it does (`GR-01`): pay at the counter, or the serial is released, as this booking's rule is |
+| bKash / Nagad-এ পরিশোধ করুন | `BTN-A07D-PAY` | The booking and its tracking link are kept on the phone first (`lib/bookings`), then the page goes to `redirectUrl`. The provider sends the patient back to `S-A-07p` |
+| লাইভ সিরিয়াল দেখুন | `BTN-A07D-LIVE` | Still offered: the serial is the patient's while it is held |
+
+Offline: the pay button is disabled with "no connection" as its reason. Under
+`PAYMENT_PROVIDER=mock` a charge settles on the spot, so the demonstration
+shows the confirmed screen; the held screen appears with a provider that
+redirects, including the simulated one (`MOCK_PAYMENT_FLOW=redirect`).
+
+### `S-A-07p` Payment return (`/pay/return?payment=&booking=`; `FR-PAY-08`, `FR-PAY-09`)
+
+Where bKash or Nagad sends the patient back. **The query string's status is
+never believed** (`FR-PAY-09`): on load the page asks `POST
+/bookings/:booking/payments/:payment/confirm` with the booking's own
+credential from this phone, and the server asks the provider.
+
+| State | Content / wiring |
+|---|---|
+| Loading | যাচাই হচ্ছে… with a spinner; the request is the server asking the provider |
+| Paid | পরিশোধ হয়েছে · সিরিয়াল N নিশ্চিত, the amount, and লাইভ সিরিয়াল দেখুন → `S-A-08` |
+| Pending | পেমেন্ট এখনো নিশ্চিত হয়নি, asked again every ten seconds until the hold ends; the countdown stays |
+| Failed or cancelled | পেমেন্ট হয়নি (or বাতিল করেছেন), the time left on the hold, and `BTN-A07P-RETRY` আবার চেষ্টা করুন (`POST /payments/intent`, a new key, the same booking; the deadline does not move) and, where the hospital takes payment at the counter, `BTN-A07P-COUNTER` হাসপাতালে পরিশোধ করব (`POST /payments/intent` with `at_hospital`) |
+| Expired | The hold ran out: the serial is now pay-at-the-counter, or it was released, as the server says, with the same sentence the SMS carries |
+| Error | যাচাই করা যায়নি, আবার চেষ্টা করুন; nothing is concluded |
+| Offline | ইন্টারনেট নেই — সংযোগ ফিরলে যাচাই হবে, and it asks when the connection returns |
+| No credential on this phone | The return was opened on another browser: আমরা যাচাই করছি, ফলাফল SMS-এ জানানো হবে. The server's timer confirms it regardless |
+
+---
+
+## A5. Live serial — the core screen
+
+**`MOD-A06D-STANDBY`** (in the booking flow, as a step): name, phone, age, sex (`FR-GST-02`), then one choice stated with its consequence — **এখনই পরিশোধ করুন — খালি হলেই সিরিয়াল আপনার** (bKash / Nagad / card; seated on sight; refunded in full if no serial comes, `FR-PAT-26`) or **পরে পরিশোধ — খালি হলে জানাব** (asked on the phone, 10 minutes to answer, `FR-PAT-27`). তালিকায় নাম দিন → `S-A-08s`.
+
+### `S-A-08s` Standby status (`FR-PAT-25`–`27`)
+
+Opened from the join, or from the SMS an offer or a seat sends; the signed status token in the URL is the place on the list. Polled every five seconds while anything can change.
+
+| State | Content / wiring |
+|---|---|
+| Waiting | How many are ahead; a badge saying whether they are seated on sight (paid) or asked here (not); তালিকা থেকে নাম তুলে নিন → confirm, stating that a prepayment comes back (`GR-01`) |
+| Offered | একটি সিরিয়াল খালি হয়েছে, minutes left to answer, payment choice as `SEG-A07C-PAY`. হ্যাঁ, সিরিয়াল নেব → `POST /standby/:token/accept` → seated. না, পরের জনকে দিন → `POST /standby/:token/decline` → the slot is offered to the next patient |
+| Seated | সিরিয়াল N আপনার, and লাইভ সিরিয়াল দেখুন → `S-A-08`. The tracking link is minted once, on the first read after the seat; a device that never saw it is told it went by SMS |
+| Left | That they left the list |
+
+### `S-A-08` Live serial (`FR-PAT-30`–`38`)
+
+**Subscriptions on mount:** session channel (`session:<id>`), plus a heartbeat every 30 s to detect a dead socket.
+
+| Element | ID | Content / wiring |
+|---|---|---|
+| Doctor status line | — | ডাক্তার এসেছেন ৫:১২ / এখনো আসেননি / ৩০ মিনিট দেরি |
+| Your number (huge) | — | Your serial |
+| Now serving | — | Current called number, animates on change |
+| Progress bar | — | Position within session |
+| ETA block | — | আনুমানিক সময় + confidence band (`FR-QUE-13`) |
+| Countdown | — | আর বাকি ~40 মিনিট, recalculated locally each minute, corrected by server events |
+| Counter's quote | `CARD-A08-QUOTE` | After reception checks the patient in (`FR-REC-18`): কাউন্টার জানিয়েছে — প্রায় ২৫ মিনিট, ৫:১০-এ বলা, and the minutes left against it. Beside the ETA block, never replacing it; when the quote has run out it says so rather than counting below zero (`FR-PAT-38`) |
+| Leave-home banner | `BANNER-A08-LEAVE` | Appears when travel + buffer ≥ remaining wait (`FR-PAT-32`). Not once the patient is checked in — they are already here |
+| Queue preview list | `LIST-A08-QUEUE` | Serving, next few, your row highlighted, late rows marked |
+| আমি দেরি করছি | `BTN-A08-LATE` | → `MOD-A08-LATE`. Disabled once checked in |
+| সিরিয়াল বদলান | `BTN-A08-RESCHEDULE` | → `S-A-07b` in reschedule mode |
+| বাতিল করুন | `BTN-A08-CANCEL` | → `MOD-A08-CANCEL` confirm with refund rule stated (`GR-01`, `FR-PAY-03`). **In taka, not as a percentage** — a person deciding wants the number they will get. Computed by `refundIfCancelledNow` in `shared/domain`, the same function the server refunds with, so the sentence and the amount cannot disagree. Four outcomes: an amount back, nothing back, nothing was paid, or the hospital has set no terms and will say |
+| Freshness line | — | সর্বশেষ হালনাগাদ X মিনিট আগে (`GR-05`) |
+
+**`MOD-A08-LATE` wiring**
+1. Sheet asks: কত দেরি হবে? (10 / 20 / 30 / 45 মিনিট).
+2. Optimistic: user's row moves to "late" styling instantly.
+3. Call: `POST /queue/late` → server writes `EVT-PATIENT_LATE`.
+4. Server effect: re-insertion after *k* patients (`FR-QUE-21`), ETAs recomputed.
+5. Broadcast: session channel → reception console shows the patient as late; all other patients' ETAs shift.
+6. Result: sheet closes, banner "আপনাকে ৩ জন পরে ডাকা হবে · আনুমানিক ৬:৩০".
+7. Failure/offline: request is queued; banner says "জানানো হচ্ছে…" and retries; if the session ends before it lands, the app tells the user to inform the counter.
+
+**Delay broadcast received (`EVT-DELAY_DECLARED`)**
+- In-app: full-width sheet appears: "ডাক্তার ৩০ মিনিট দেরিতে আসবেন" with `BTN-A08-KEEP` (keep serial), `BTN-A08-RESCHEDULE`, `BTN-A08-CANCEL` (`FR-PAT-34`).
+- Backgrounded app: push notification; tapping opens this sheet.
+- No app: SMS with the same three options explained as reply keywords or a link.
+
+**Called notification (`EVT-PATIENT_CALLED` for your serial)**
+- Push + in-app takeover: "আপনার ডাক এসেছে — ৩ নম্বর কক্ষে যান", with a stop-vibration acknowledge button.
+
+### `S-A-09` My serials (tab)
+
+| Element | ID | Wiring |
+|---|---|---|
+| Today section | — | Current bookings (`FR-PAT-39`), each → `S-A-08`. A booking from an earlier date whose session is still running or paused is listed here, not under past: the date changing settles nothing. One whose status cannot be checked is listed here too, marked unknown with the age of what was last known |
+| Upcoming section | — | Future bookings with reschedule/cancel |
+| Past section | — | Settled bookings and bookings of sessions that have ended: completed visits → `S-A-12` record detail; each offers মতামত দিন (`FR-PAT-83`). Never a booking whose only fault is that midnight passed |
+
+**Whose serials (plan F1).** *Signed in:* the account's, from `GET /me/bookings`: every profile it owns, booked on any phone, as a guest and since claimed, or at a counter. The list is the same on every phone, and a line under it says so (**আপনার অ্যাকাউন্টের সিরিয়াল। যে ফোনেই লগ ইন করুন, একই তালিকা দেখবেন।**). Where each stands is the server's answer in that one read. Anything this phone booked that the account does not hold is still listed beside them. Opening one uses the tracking link this phone holds for it; when it holds none the address is `/s?b=<id>`, and `S-A-08` asks for a link (`POST /me/bookings/:id/link`), keeps it, and opens as usual. The same list feeds `BTN-A02-ACTIVE` on Home. *Not signed in, or the server out of reach:* what this phone booked, saying so (**এই ফোনে নেওয়া সিরিয়াল…**), exactly as before. Signing out forgets the links kept for the account.
+
+**Sessions crossing midnight (`FR-QUE-06`, `FR-PAT-39`; founder's decision, 2026-10-05).** The staff side already works this way: the console's picker lists a chamber still running from the day before. **The patient side does too** (plan A4): the strip and the sections ask the server where each booking stands (`lib/standing.ts`, one read of its tracking link) and go by that, never by the date. Until the answer comes, Home shows only what the phone already knows to be current and My serials shows the shape of the list; a booking it knows to be past is not asked about again. An answer that cannot be had makes a booking **unknown**: it stays in the first section and on the strip with **এখনকার অবস্থা জানা যাচ্ছে না**, and **শেষ জানা …** with the age of the last answer when there was one. The strip's title is **আপনার সিরিয়াল চলছে**, not "today's". A session keeps the date it was scheduled for. A patient still waiting, late, called or in the chamber when midnight passes is still current on Home and under Today; so is everybody in a chamber that is paused across midnight. The booking moves to Past when the patient has been seen or has cancelled, or when the session ends. Nothing is copied or moved to the next day: the next day's scheduled chamber is its own session and both can be open at once. Reports and history keep the original date.
+
+---
+
+## A6. Emergency
+
+> **Built in this version** (step 15): `S-A-10`, `S-A-10b` and `S-A-10c`, every
+> control below except the ambulance flow behind `BTN-A10-AMB`, which is
+> outside V1 and has no button (owner, 2026-10-05).
+>
+> - **The critical/urgent split (`FR-PAT-41`)** had no control here; the owner
+>   ruled (2026-09-21) two, under the call: `BTN-A10-CRITICAL` জীবন ঝুঁকিতে →
+>   `S-A-10b?mode=critical`, which shows the call again, **one** result — the
+>   top of the ranking — and the problem chips to narrow it; `BTN-A10-URGENT`
+>   জরুরি opens the chips, each → `S-A-10b?problem=<type>`, the full ranked list.
+>   `S-A-10` uses no client JavaScript (links and a native `<details>`), so a
+>   tap before hydration is never swallowed.
+> - **Problem → capability** (owner's ruling): দগ্ধ → burn unit (and burn beds
+>   are the ones counted), দুর্ঘটনা → trauma OT, হৃদরোগ → cardiac, স্ট্রোক →
+>   stroke; শিশু, প্রসূতি, শ্বাসকষ্ট, অন্যান্য need only an ER. Only facilities
+>   with an ER console are listed — "I'm on my way" must ring somebody.
+> - **Position** is the browser's own prompt. Refused or absent, the list is
+>   ranked without distance and says so; nothing about a position is stored.
+> - **The card** shows capability, distance, an estimated travel time labelled
+>   আনুমানিক, ER load (counted, `FR-EMG-04` — ER wait in minutes is not measured,
+>   so the load is shown instead), free beds of the relevant kind, ICU, and
+>   freshness. The ranking and the stale badge use the figures the ranking
+>   stands on (capability and the relevant beds); the ICU line carries its own age.
+>   The first card is the answer and is headed "best placed now", never
+>   "nearest": a nearer stale hospital can rank below it (`FR-PAT-45`).
+> - **`BTN-A10-ONWAY`** opens a sheet with phone, age and sex, all optional; a
+>   blank send works. On failure the card says the hospital could not be told
+>   and keeps directions and the call.
+> - **`S-A-10c`** is live by a five-second look while the answer can change
+>   (no public socket, `docs/STATUS.md` decision 35), not a channel. States:
+>   waiting, হাসপাতাল প্রস্তুত, received, **declined** (with the ER's reason and
+>   অন্য হাসপাতাল দেখুন), called off.
+> - **Offline**: the last list seen for the same problem, with its age, and the
+>   call; "I'm on my way" is not offered.
+
+### `S-A-10` Emergency triage (no auth, `FR-PAT-40`)
+
+| Element | ID | Wiring |
+|---|---|---|
+| ৯৯৯ এ কল করুন | `BTN-A10-999` | `tel:999` immediately; always visible at top |
+| জীবন ঝুঁকিতে | `BTN-A10-CRITICAL` | → `S-A-10b?mode=critical`: the call and one answer, no browsing (`FR-PAT-41`) |
+| জরুরি | `BTN-A10-URGENT` | Since 2026-10-07 (Visual Direction 2) the problems are shown at once, as an icon grid under **কী হয়েছে?**; this control is that heading's link to them, and never hides them (`FR-PAT-41`) |
+| Critical warning text | — | Names the conditions that mean "call first" |
+| Problem chips | `CHIP-A10-<type>` | দগ্ধ / দুর্ঘটনা / হৃদরোগ / স্ট্রোক / শ্বাসকষ্ট / শিশু / প্রসূতি / অন্যান্য. Selecting one → loads `S-A-10b` results filtered by required capability |
+| ~~অ্যাম্বুলেন্স~~ | ~~`BTN-A10-AMB`~~ | **Not in V1** (owner, 2026-10-05). The call to 999 above it is what `FR-PAT-47` keeps on this screen |
+
+### `S-A-10b` Emergency results (`FR-PAT-43`–`46`)
+
+Ranking: capability match → travel time → ER load → free beds. Stale facilities are de-ranked and labelled (`FR-PAT-45`).
+
+**Inside a hospital's own portal (`FR-BRD-09`).** The list is the same list: every participating hospital, ranked the same way, never narrowed to the portal's own. Under the call to 999 one line says so and names the hospital whose portal it is (জরুরি অবস্থায় শুধু … নয়, যুক্ত সব হাসপাতাল দেখানো হয়). The network's own app shows no such line.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Result card | `CARD-A10-<hospitalId>` | Shows capability chip (আছে / নেই), distance, travel time, ER wait, free beds, ICU, freshness |
+| আমি রওনা দিচ্ছি | `BTN-A10-ONWAY-<id>` | → `POST /emergency/inbound` → emergency console alert (`FR-EMG-01`) → confirmation screen `S-A-10c` |
+| দিকনির্দেশ | `BTN-A10-NAV-<id>` | Opens map navigation |
+| কল করুন | `BTN-A10-CALL-<id>` | Dials ER desk directly |
+| Stale badge | — | "তথ্য ১৮ মিনিট পুরোনো" in amber when beyond threshold |
+
+**`BTN-A10-ONWAY` wiring**
+1. Optimistic: card turns to "জানানো হয়েছে" instantly.
+2. Call: inbound alert with problem type, ETA estimate, and caller number (optional profile data if logged in).
+3. Broadcast: ER console `hospital:<id>:emergency` channel rings an alert.
+4. Result: `S-A-10c` showing directions, the hospital's ER phone, and a live "hospital acknowledged" state when the coordinator taps প্রস্তুতি নিন.
+5. Failure/offline: still navigates; banner says the hospital could not be notified, advises calling.
+
+### `S-A-10c` On the way
+
+| Element | ID | Wiring |
+|---|---|---|
+| Acknowledge state | — | অপেক্ষায় → হাসপাতাল প্রস্তুত (live via channel) |
+| নেভিগেশন খুলুন | `BTN-A10C-NAV` | Map app |
+| ER কল | `BTN-A10C-CALL` | Dials |
+| বাতিল | `BTN-A10C-CANCEL` | Notifies ER that the patient is not coming |
+
+---
+
+## A7. Beds, wallet, and the rest
+
+### `S-A-11` Bed search (`FR-PAT-50`–`53`)
+
+> **Built in this version** (step 14): the chips, the results and
+> `MOD-A11-REQUEST`, and the request status at `/beds/request?t=…`.
+>
+> - Each result shows free of total for the chosen kind, the nightly price (a
+>   range when wards differ), and that kind's own freshness; past the stale
+>   threshold it adds "call the hospital before you go". Fresh-and-free ranks
+>   above stale-and-free, and a hospital with none free stays listed, last.
+> - **Owner, 8 October (`FR-PAT-14`; plans K2, K3):** the count is shown only
+>   while it is fresh, and a fresh zero reads **এখন খালি নেই**. Past the
+>   threshold, or never confirmed, the result reads **খালি বেডের খবর জানা নেই**
+>   with the age of the last confirmation and the advice to call (decision 10
+>   replaced K2's "were free when last confirmed"). No number appears for a
+>   figure that is stale, and nothing unknown is ever drawn as ০. The same rule
+>   holds on a hospital's card and on an emergency result.
+> - The list re-reads every thirty seconds while visible. There is no public
+>   realtime room (BACKEND.md §6), and every number says how old it is.
+> - The request needs name, phone, age and sex, like a guest booking; the OTP
+>   `FR-GST-03` asks for is deferred with authentication (`CLAUDE.md` §4.1).
+>   The sheet says a request is not a hold before it is sent.
+> - The status link is a signed token this phone keeps (there is no SMS until
+>   the hospital answers). A hold counts down in minutes and reads "expired"
+>   the moment it runs out. `FR-PAT-53` (family profiles) needs accounts and is
+>   not built.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Bed type chips | `CHIP-A11-<type>` | সাধারণ / কেবিন / এইচডিইউ / আইসিইউ / সিসিইউ / এনআইসিইউ / বার্ন |
+| Hospital result row | `CARD-A11-<id>` | Free count, nightly price, freshness |
+| বেড অনুরোধ করুন | `BTN-A11-REQUEST-<id>` | → `MOD-A11-REQUEST` (patient profile, expected arrival, condition note) → where the deployment asks, `MOD-GST-OTP` inline (`FR-GST-03`) → `POST /bed-requests` → ward console pending list (`FR-BED-07`) |
+| Request status | — | অনুরোধ পাঠানো → গৃহীত (hold expiry countdown) → নিশ্চিত / বাতিল |
+
+### `S-A-12` Health wallet (`FR-PAT-60`–`65`)
+
+> **Built in this version:** `TAB-A12-TL` as the whole screen, `CARD-A12-<recordId>`
+> opened out in place (no detail view, no PDF), `BTN-A12-QR` as a copyable code
+> with its scope and the grant's length stated first, and `BTN-A12-ACCESS` with
+> revoke.
+>
+> The timeline is **this device's**: there are no accounts (`CLAUDE.md` §4.1),
+> so it is assembled from the tracking links the phone holds, each of which
+> carries its booking's record (`FR-GST-08`). A link that has expired is said to
+> have expired, and a request that failed is an error with a retry — neither is
+> folded into "no records".
+>
+> **`TAB-A12-REP` is built** (step 17). Each tracking link carries the tests
+> its booking's consultation ordered (`FR-GST-08`), so the tab is real. It
+> appears **only when there is something in it**: a person who has never had a
+> test is not shown an empty Reports tab. A test still on a bench is listed
+> with what is happening to it — "we are testing it" is a different sentence
+> from "you have no reports", and it is the one that stops somebody ringing
+> the hospital. A delivered report opens through a signed URL minted at the
+> moment of tapping, because a signature expires.
+>
+> **A visit's medicines are on its card** (plan R2, `FR-DOC-04`): each row's
+> name, strength, schedule, days and instruction, under the diagnosis and
+> advice. A visit with medicines offers **প্রিন্ট বা PDF** (`BTN-A12-PRINT`),
+> which opens the same Bangla sheet the doctor prints (`FR-DOC-07`) and the
+> browser's print, where it can also be saved as a PDF.
+>
+> **Not built:** `TAB-A12-RX` (its point is the reminders of `FR-PAT-72`,
+> which are not built), `BTN-A12-UPLOAD` (on the Profile tab since plan R3, for a signed-in account) and `BTN-A12-EXPORT` (one
+> PDF of everything, `FR-PAT-65`). None is rendered as an empty tab; the
+> screen names them in one line instead.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Tab: টাইমলাইন | `TAB-A12-TL` | Visits, prescriptions, reports, chronologically |
+| Tab: রিপোর্ট | `TAB-A12-REP` | Lab and imaging only |
+| Tab: ওষুধ | `TAB-A12-RX` | Active prescriptions with reminder toggles (`FR-PAT-72`) |
+| Record row | `CARD-A12-<recordId>` | → record detail with PDF viewer and share |
+| প্রিন্ট বা PDF | `BTN-A12-PRINT` | On a visit with medicines: the printed sheet (`FR-DOC-07`) and the browser's print (plan R2) |
+| পুরোনো কাগজ যোগ করুন | `BTN-A12-UPLOAD` | Camera/gallery → tag date, doctor, type → stored (`FR-PAT-62`). Built in plan R3 on the Profile tab, under each profile of a signed-in account (`FRM-A19-DOC`): the file, its kind, its date, the doctor; the list beneath with **খুলুন** (a signed link) and **সরান**. On `S-A-12` a device with no account is told in one line that old papers are kept under a signed-in profile, with the way there |
+| QR দেখান | `BTN-A12-QR` | Full-screen QR for the doctor console to scan (`FR-PAT-63`); shows consent scope and expiry |
+| কে দেখেছে | `BTN-A12-ACCESS` | Access log: hospital, person, timestamp (`FR-SEC-03`, `FR-PAT-64`) |
+| সব ডাউনলোড | `BTN-A12-EXPORT` | Generates a single PDF |
+
+### `S-A-13` Diagnostics booking
+Catalogue → select tests → centre comparison (price, distance, turnaround) → home collection toggle → slot → pay → confirmation. Report lands in wallet with a push (`FR-PAT-61`).
+
+### `S-A-14` Pharmacy
+Prescription QR → nearby partner pharmacies with stock status → reserve or request delivery → dispensing recorded (`FR-PHR-01`).
+
+**Inside a hospital's own portal (`FR-BRD-09`)** the medicine search below asks about that hospital's pharmacy only (`GET /medicines?scope=`), its introduction names the hospital, and the first screen does not offer it at all where the hospital runs no pharmacy or does not share its shelf. The same holds for the bed tile where it runs no ward. রেকর্ড is always offered: the wallet is the patient's own, wherever a visit was made (`FR-BRD-10`).
+
+> **Not built as specified, because all three steps hang off a prescription**
+> this version does not write (`PRD.md` §9, §12). What is built instead is the
+> part that needs none: a **medicine availability search** at `/medicines`,
+> reached from the home screen, which is `FR-PHR-02`'s other half. A family
+> holding a paper prescription from any doctor anywhere can still find out who
+> has the medicine.
+>
+> It answers in three, never two: **আছে**, **নেই**, or **জানা নেই** for a
+> pharmacy that has not confirmed in twelve hours or never flagged that
+> medicine at all. Folding *unknown* into *no* invents a shortage; folding it
+> into *yes* sends somebody across Dhaka for nothing (`PRD.md` §3.2). A
+> pharmacy that never flagged the medicine still appears — an absent hospital
+> would read as "does not stock it", which is a claim nobody made. The summary
+> line counts all three rather than reaching a verdict (`GR-05`), and every row
+> carries the age of the claim behind it.
+
+### `S-A-15` Telemedicine
+Same session/queue mechanics; live serial screen switches its primary action to "কলে যোগ দিন", enabled when called (`FR-PAT-73`).
+
+> **`S-A-15`, `S-A-16` and `S-A-17` are outside V1** (owner, 2026-10-05; `PRD.md` §7.8). They are kept here as specified for a later version; no screen, tile or link in the patient app leads to them.
+
+### `S-A-16` Ambulance (`FR-PAT-74`)
+Type selector (basic / ICU / freezer) → pickup location (auto or pin) → destination (optional) → **fare quote shown before dispatch** → নিশ্চিত করুন → driver identity + live ETA → completion. The quoted fare is locked; any change attempt is a violation flagged to support.
+
+### `S-A-17` Blood (`FR-PAT-75`)
+Request: group, units, hospital, urgency, patient name → broadcast to eligible donors nearby → responses list with contact → mark fulfilled. Donor side: availability toggle, last donation date, eligibility countdown.
+
+### `S-A-18` Notifications centre
+All notifications grouped by day; tapping routes to the relevant screen; per-category preferences link to settings.
+
+### `S-A-19` Profile & settings
+
+The আরও tab since 2026-10-07 (`NAV-A`). It lists only what works: the account or sign-in, the people booked under the signed-in number (never called a family: family accounts are not in V1, `FR-PAT-02`), language, record permissions, help, the hospital link and sign-out. The official logo sits at its foot.
+
+
+| Element | ID | Wiring |
+|---|---|---|
+| Profiles | `BTN-A19-PROFILES` | Add, edit, remove, set relationship, claim by phone (`FR-PAT-04`) |
+| Language | `SEG-A19-LANG` | bn / en, applies to app and SMS (`FR-NOT-04`) |
+| Notifications | `BTN-A19-NOTIF` | Per-category toggles; queue and emergency categories cannot be disabled while a booking is active |
+| Payment methods | `BTN-A19-PAY` | Saved methods |
+| Consents | `BTN-A19-CONSENT` | Per-hospital record access, revoke (`FR-PAT-64`) |
+| Help & support | `BTN-A19-HELP` | FAQ, WhatsApp support, call |
+| হাসপাতাল কর্তৃপক্ষ? | `BTN-A19-FORHOSPITAL` | The **only** staff-facing link in the app; opens the marketing site's hospital page in the browser |
+| লগ আউট | `BTN-A19-LOGOUT` | Confirm → clears token, keeps cached public data |
+
+---
+
+# PART B — HOSPITAL CONSOLE (web, desktop)
+
+Accessed at `console.[domain]`. Designed for 1280px+ monitors, mouse and keyboard, high information density, and continuous use for eight hours.
+
+## B0. Console authentication
+
+> **Phase 8B Batch 2 (10 October 2026):** approved staff-access presentation now uses the shared console foundation. After required password/MFA steps, current `/staff/me` permissions, module configuration and actual desk/chamber assignments determine landing. A single unambiguous facility workspace opens directly; multiple roles/desks require selection. A single reception desk covering several chambers still requires a chamber choice. Doctors always choose explicitly until a real account mapping is approved. Existing server guards, hospital-code flow, optional MFA, refresh/revocation and scoped explicit queue reads remain intact. Details and verification: `docs/design/console-access/README.md`. Patient Registration and clinical/administrative workspace redesigns are excluded.
+
+### `S-B-00` Staff login
+
+| Element | ID | Wiring |
+|---|---|---|
+| Hospital code / email | `INP-B00-ID` | Staff identity is email or staff-ID + hospital code |
+| Password | `INP-B00-PW` | |
+| লগ ইন | `BTN-B00-LOGIN` | → `POST /staff/login` → if 2FA enabled → `S-B-00b` OTP → else `S-B-01` |
+| পাসওয়ার্ড ভুলে গেছেন | `BTN-B00-FORGOT` | Admin-mediated reset request |
+| Language toggle | `SEG-B00-LANG` | Console defaults to Bangla. While `S-B-00` is deferred (`CLAUDE.md` §4.1), it sits at the right end of the header of `S-B-01` and of every console: বাংলা / English, stored on the device |
+
+**Rules:** no self-signup (`FR-SUP-01` — accounts are created by hospital admin or platform; a hospital that is not on the platform applies for a workspace on `S-B-00a`), individual accounts only (`FR-SEC-06`), session timeout configurable per hospital with a re-auth modal that never loses queued work.
+
+**In the pilot build (step 21, `CLAUDE.md` §4.2):** `S-B-00` is what the console shows whenever `DEMO_MODE` is off; the picker (`S-B-01` as built) remains the demo's way in. The hospital code field appears only when the server answers `AUTH_HOSPITAL_REQUIRED`. Wrong email and wrong password get one message. After five failures the screen says when the account opens again (`AUTH_LOCKED`). An account whose password an administrator set shows `S-B-00c` — set your own password, twice, at least ten characters — before any console. A person holding several roles chooses one on `S-B-01` (role cards only, no counter selector yet); a person with one role goes straight to it. The rail's foot gains **লগ আউট**.
+
+### `S-B-00a` A hospital applies by itself (plan D1, `FR-ONB-09`, `FR-ONB-10`)
+
+Public, at `console.[domain]/?apply=1`: nobody is signed in, because the hospital has no account yet. Reached from `S-B-00` (**আপনার হাসপাতাল এখনো যুক্ত হয়নি? হাসপাতাল যুক্ত করতে আবেদন করুন**, `LNK-B00-APPLY`) and, on a demonstration, from the foot of the picker (`LNK-B01-APPLY`). Somebody already signed in is not shown it. This is the one exception to "no self-signup" above: it makes a workspace and its first administrator, never an account inside a hospital that exists.
+
+| Element | ID | Wiring |
+|---|---|---|
+| What applying does | `TXT-B00A-NOTHING-PUBLIC` | Above the form and again on the answer: applying does not show the hospital to patients; it goes live only after its details are filled in, review is asked for, and a person at the platform approves (`FR-ONB-04`). On a demonstration a second line says the form works and that real details and a real password do not belong in it (`FR-DEM-07`, `FR-SEC-08`) |
+| The facility | `FRM-B00A-APPLY`: `INP-B00A-NAME-BN`, `-NAME-EN`, `CHIP-B00A-KIND-<kind>`, `CHIP-B00A-DIVISION-<division>`, `INP-B00A-DISTRICT`, `-PHONE`, `-REGISTRATION` | Name in Bangla and in English, kind, division, district, the facility's phone (a landline or a mobile, typed as people type one: `02 912345678`, Bangla digits, spaces and hyphens are read) and its licence or registration number. No hospital code is asked for |
+| Its first administrator | `INP-B00A-ADMIN-NAME`, `-ADMIN-EMAIL`, `-ADMIN-MOBILE`, `-PASSWORD`, `-PASSWORD-AGAIN` | Name, email, mobile (`01…`, kept as `+8801…`) and a password of their own, twice, at least ten characters. A field that is wrong says so under itself as it is typed: a number that is not one, an email that is not one, a password too short, two that differ |
+| আবেদন পাঠান | `BTN-B00A-SUBMIT` | Off, with the reason, until every field is right, and offline. → `POST /hospital-applications` with an Idempotency-Key made once for the form → the answer below. A form whose answer was lost is sent again with the same key and is answered with the workspace the first made |
+| অ্যাকাউন্ট আছে? লগ ইন করুন | `LNK-B00A-LOGIN` | → `S-B-00` |
+| The answer | `PANEL-B00A-DONE` | **আবেদন পাওয়া গেছে**: the hospital code that was made and the email to sign in with; that the workspace is not visible to patients; then the four steps in order (sign in; set up two-step verification; add departments, doctors, schedules, beds and staff, with the checklist on `S-B-11` saying what is missing; ask for review) and **লগ ইন করুন** → `S-B-00`. The password is cleared from the screen's memory when the answer arrives and is nowhere on the page |
+
+**States (`GR-03`).** There is nothing to load and nothing to be empty: the form is the screen. **Offline:** a line says so, the form keeps what was typed and the button says why it cannot be pressed. **Refused:** one sentence saying which it was, with what was typed kept: too many applications waiting for the platform (paused, not a fault); several from this connection within the hour; a field the server did not accept; a password the server's rule refuses; or it could not be sent, in which case sending again is the same application.
+
+**What it makes:** a workspace that is **setting up** and one `hospital_admin`, and nothing else. The applicant signs in on `S-B-00` with their own password (there is none to change, so no `S-B-00c`), meets `S-B-00d` before any console, and from there is on `S-B-11` like every new hospital.
+
+### `S-B-00b` Two-step code (pilot step 28, `FR-SEC-10`)
+
+| Element | ID | Wiring |
+|---|---|---|
+| কোড | `INP-B00B-CODE` | Six digits from the authenticator app, or a recovery code (`xxxx-xxxx-xxxx`) for a lost phone — one field; Bangla digits are read as the same digits |
+| যাচাই করুন | `BTN-B00B-VERIFY` | → `POST /staff/2fa` `{challenge, code}` → the session → `S-B-01` (or `S-B-00c` if the password was set by an administrator) |
+| আবার পাসওয়ার্ড দিন | `BTN-B00B-BACK` | back to `S-B-00`; the only way on once the five-minute challenge has run out |
+
+**Rules:** shown in place of `S-B-00` when the password was right and the account has the second factor on. A wrong code says so and empties the field; five wrong codes or passwords in a row lock the account (`AUTH_LOCKED`), and a right password does not reset the count.
+
+### `S-B-00d` Turn on two-step verification (pilot step 28, `FR-SEC-10`)
+
+| Element | ID | Wiring |
+|---|---|---|
+| QR code and key | `IMG-B00D-QR` | `POST /staff/2fa/setup` → drawn in the browser from the `otpauth://` link; the key beside it in groups of four for typing |
+| কোড | `INP-B00D-CODE` | the code the app now shows |
+| চালু করুন | `BTN-B00D-ENABLE` | → `POST /staff/2fa/enable` → the ten recovery codes, once |
+| আমি কোডগুলো নিরাপদে রেখেছি / কনসোলে যান | `CHK-B00D-KEPT`, `BTN-B00D-CONTINUE` | continue is off until the box is ticked; then the console the URL asked for, or `S-B-01` |
+| এখন নয় | `BTN-B00D-CANCEL` | only when it is not required |
+
+**Rules:** an administrator (`hospital_admin`, `platform_admin`) with no second factor meets this after `S-B-00`/`S-B-00c` and before any console, whatever the URL; the server refuses their token everywhere else (`AUTH_2FA_SETUP_REQUIRED`). Anybody else opens it from `S-B-01` (**দুই ধাপের যাচাই চালু করুন**, `/?view=2fa`), which says **দুই ধাপের যাচাই চালু আছে** once it is on, and warns when three or fewer recovery codes are left. A lost phone is an administrator's reset on `S-B-11`.
+
+### `S-B-01` Role & counter selection
+
+Shown when a user holds multiple roles or the hospital has multiple counters.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Role cards | `BTN-B01-ROLE-<role>` | রিসেপশন / ডাক্তার / ওয়ার্ড / জরুরি / ল্যাব / ফার্মেসি / ব্যবস্থাপনা → routes to that console |
+| Chamber cards | `BTN-B01-CHAMBER-<sessionId>` | The facility's chambers for today, and any still running or paused from the day before (`FR-QUE-06`). Each card says the doctor, the department, the room, **the chamber's service date and its planned start**, its status and how many are waiting. A chamber that is not today's says which day it is from, in words, so yesterday's and today's chamber for one doctor cannot be taken for each other (owner's decision, 2026-10-05). An ended chamber is not offered as current |
+| Counter selector | `SEL-B01-COUNTER` | **Built as the desk choice (plan R4, `FR-REC-32`):** where the hospital has desks, a row above the chambers — সব চেম্বার and each desk — remembered on this device per hospital. With a desk chosen the chamber list is in two parts, এই ডেস্কের চেম্বার then অন্য চেম্বার. A signed-in receptionist assigned to a desk is sent only that desk's chambers by the server (`GET /staff/chambers`), and is refused any other (`outside_your_desk`). Billing reconciliation per counter (`FR-REC-23`) is not built |
+| Platform administration | `BTN-B01-PLATFORM` | Shown to a platform administrator only (on a demonstration, whenever there is a seeded one): **হাসপাতাল অনবোর্ডিং খুলুন** → `S-B-12`. Beside the national dashboard's own section, and like it belonging to no hospital |
+| Remember on this computer | `CHK-B01-REMEMBER` | Skips this screen next time |
+
+---
+
+## B1. Reception console — `S-B-02`
+
+> **Phase 8B Batch 3A (10 October 2026):** Reception now opens an authorised desk as an expandable multi-chamber workspace (`?view=reception`), while existing `?session=` links remain compatible. Each card retains its own V1 queue state, pending/rejected actions, undo and forms; collapse does not unmount it. One selected expanded queue owns N/Space, A, P, W and queue Ctrl+Z; editors, composing/repeated keys, dialogs/Help and native button Space remain protected. Secondary row/session actions use visible More menus. Add Patient uses the existing registration finder and the selected card's actual session. The server issues the serial; the same attempt key and original booking receipt are used after an uncertain reply. Current hospital/role/module/desk rules are revalidated, and finished/cancelled chambers stay read-only. The normal work picker still omits ended chambers; Reception opts into their scoped roster read. Details, comparison and evidence: `docs/design/console-reception/README.md`. Full Registration and Doctor redesigns remain outside this batch; Doctor C1/C2 protection remains a critical clinical-release dependency.
+
+The highest-traffic screen in the system. Every primary action must be reachable by keyboard.
+
+### B1.1 Layout
+
+- Left: navigation rail (সিরিয়াল, রেজিস্ট্রেশন, বেড, জরুরি, টেস্ট, ফার্মেসি, বিল, ড্যাশবোর্ড) + offline/sync status block.
+  **The hospital's own, at its head (`FR-BRD-12`, plan K4):** its logo when it has one, its name, and beneath them a small **Powered by MedLiveBD**; the rail wears the hospital's colours where it has set them (`GET /hospital/brand`, any member of its staff). Until that answers, and offline with nothing kept, the rail shows the name from the session on the platform's colour, as before: the brand never stands between a member of staff and their work.
+  Shared by every hospital console. Each item opens its console **for the same facility**; সিরিয়াল returns to the chamber last opened in that tab, or to `S-B-01` if none was. ফার্মেসি opens the pharmacy console (`S-B-09`). রেজিস্ট্রেশন opens `S-B-03` (pilot step 23). An item with no screen behind it — বিল while `S-B-04` is not built, or a console the facility does not run — is shown switched off with the reason beneath it (`FRONTEND.md` §5.1), never as a label that ignores a click. (বিল used to open the pharmacy console, so a person who clicked Billing landed on medicine stock; changed after the Marks handbook check, 2026-09-28.)
+- Top: session bar (doctor, department, planned window, actual arrival) + primary actions.
+- Centre: the queue table.
+- Right: now-serving card, today's counters, waitlist recovery card, last broadcast log.
+
+### B1.2 Session bar controls
+
+| Control | ID | Keyboard | Wiring |
+|---|---|---|---|
+| Session selector | `SEL-B02-SESSION` | `Alt+S` | Switches the session this counter is driving; subscribes to that session channel |
+| ডাক্তার এসেছেন | `BTN-B02-ARRIVED` | `A` | Optimistic: status flips instantly → `EVT-DOCTOR_ARRIVED` with actual time → ETAs recomputed → broadcast to all patients + push/SMS "ডাক্তার এসেছেন" (`FR-REC-02`) |
+| দেরি ঘোষণা | `BTN-B02-DELAY` | `D` | Opens `MOD-B02-DELAY`: 15/30/45/60/custom + optional reason → `EVT-DELAY_DECLARED` → every waiting patient notified with keep/reschedule/cancel (`FR-REC-03`, `FR-PAT-34`) |
+| বিরতি / আবার শুরু | `BTN-B02-PAUSE` | `P` | `EVT-SESSION_PAUSED`; ETAs freeze and shift; resume with the same button, which reads আবার শুরু while paused and sends `EVT-SESSION_RESUMED` (`FR-REC-05`). While paused a banner under the session bar says since when, `BTN-B02-NEXT` is off with the reason, and nobody can be marked absent; the no-show grace starts again at resume. Off (with the reason) until the doctor has arrived |
+| আজ বসবেন না | `BTN-B02-ABSENT` | — | Confirm (`GR-01`) → cancels session, notifies all, opens bulk reschedule tool (`FR-REC-04`), triggers refund eligibility (`FR-PAY-07`) |
+| ওয়াক-ইন যোগ | `BTN-B02-WALKIN` | `W` | Opens `MOD-B02-WALKIN` (see B1.4) |
+| চেম্বার শেষ করুন | `BTN-B02-END` | — | Ends the chamber on screen, and only that one (owner's decision, 2026-10-05). Opens `MOD-B02-END` (below). Then `POST /sessions/:id/end` → `EVT-SESSION_ENDED`. The console then says the chamber has ended and offers the way back to `S-B-01`; the chamber is no longer listed there as current, and everything in it stays in the record. Needs a connection, as a walk-in does: an end the server has not been told is not an end. **Off while a patient is in the chamber**, with the reason: finish that consultation first. Another day's chamber for the same doctor is a different session and is not touched (`FR-QUE-06`): ending yesterday's chamber, still open because it ran late or nobody closed it, leaves today's exactly as it was. Without this control a chamber stayed "running" for ever, and the next morning it was the first one offered |
+
+**`MOD-B02-END` — ending a chamber must not strand anybody silently (owner's decision, 2026-10-05).**
+
+- **Nobody is in the chamber.** The control is off until whoever was called has been finished, and the server refuses the end as well (`BACKEND.md` §7.4): a second counter whose screen has not caught up is told the patient is still in the chamber, nothing is written, and its screen is put right. Patients who are only waiting, late or booked do not stop an end; the confirmation below is what they get.
+- **Nobody left unseen:** one confirmation (`GR-01`), naming the doctor and the chamber's date, safe option on the left.
+- **Patients left unseen** (booked, waiting or late): the confirmation says how many, in a sentence — "৭ জন রোগীকে দেখা হয়নি। চেম্বার শেষ করলে এই সেশনে আর কোনো কাজ করা যাবে না।" — and the end button stays off until the person has ticked that they have read it. A tap on the backdrop does not close it.
+- **Ending changes nobody's status.** Those patients are not marked absent, cancelled or seen to tidy the session: they stay as they were, in a chamber that has ended, and that is what the record says happened.
+- **Money is as it was.** A patient who paid and was not seen is owed a refund the moment the chamber ends (`FR-PAY-07`), exactly as before this control existed.
+| **পরবর্তী রোগী ডাকুন** | `BTN-B02-NEXT` | `Space` or `N` | The single most-used control (see B1.3) |
+
+### B1.3 `BTN-B02-NEXT` — full wiring
+
+1. **Guard:** if a patient is currently in chamber and not marked done, the button label reads "এই রোগী শেষ ও পরবর্তী", performing both actions.
+2. **Optimistic UI:** current row moves to *done*, next waiting row becomes *in chamber*, now-serving card updates, counters increment. Zero perceived latency (`NFR-02`).
+3. **Local write:** `EVT-PATIENT_DONE` (with measured duration) + `EVT-PATIENT_CALLED` appended to the local log.
+4. **Sync:** pushed to server immediately when online; queued when offline (`FR-QUE-50`).
+5. **Server effect:** rolling consultation rate updated (`FR-QUE-12`), all downstream ETAs recomputed (`FR-QUE-11`).
+6. **Broadcast:** `session:<id>` channel → every patient device updates within 2 s (`NFR-01`); the called patient additionally receives push + SMS.
+7. **Result UI:** undo toast for 10 s (`GR-02`); pressing undo takes back the whole tap — the call, then the finish that went with it — by appending a compensating event for each (never deletes history). If the tap has not been sent yet (offline), it is simply not sent. `Ctrl+Z` does the same for the last action of any kind, once, inside the ten seconds; the toast then says what happened (taken back, too late, no connection, nothing to undo).
+8. **Failure:** sync failure keeps the optimistic state and shows the pending-sync counter; a rejected event (e.g. another counter already called that patient, `FR-QUE-53`) rolls the row back with an explanatory toast.
+
+### B1.4 Queue table
+
+Columns: serial, patient, age, phone, status, source (app / phone / walk-in), waited, actions.
+
+| Row action | ID | Wiring |
+|---|---|---|
+| এসেছেন | `BTN-B02-CHECKIN-<serial>` | On a booked or late row not yet checked in → `MOD-B02-CHECKIN` → `EVT-PATIENT_ARRIVED` with the quoted wait; queued offline like every row action. The row then reads এসেছেন with the quote under it (`FR-REC-18`) |
+| দেখা শেষ | `BTN-B02-DONE-<serial>` | `EVT-PATIENT_DONE`, duration captured |
+| দেরি | `BTN-B02-LATE-<serial>` | `EVT-PATIENT_LATE` → re-insert after *k* (`FR-QUE-21`) → patient notified of new position |
+| অনুপস্থিত | `BTN-B02-NOSHOW-<serial>` | Enabled only after grace period (`FR-QUE-20`); confirm → `EVT-PATIENT_NO_SHOW` → slot freed → waitlist card activates |
+| ফিরিয়ে আনুন | `BTN-B02-REINSTATE-<serial>` | Visible on no-show rows → `EVT-PATIENT_REINSERTED` with actor logged (`FR-QUE-22`) |
+| অগ্রাধিকার | `BTN-B02-PRIORITY-<serial>` | Drag or button → `MOD` requires a reason → `EVT-PRIORITY_REORDERED` (`FR-REC-15`) |
+| রোগীর তথ্য | `BTN-B02-INFO-<serial>` | Side panel: profile, previous visits at this hospital, payment status |
+
+**`MOD-B02-CHECKIN`**: one question — how long are you telling them? Pre-filled from the queue's own estimate (`suggestedQuote`, the function the patient's phone counts down from), moved in fives with − and +, capped at 480. নিশ্চিত করুন → `EVT-PATIENT_ARRIVED { bookingId, quotedWaitMinutes }`; the arrival time is the server's. The quote reaches `S-A-08` as `CARD-A08-QUOTE`. No SMS: it was said across the counter (`FR-REC-18`, `FR-PAT-38`).
+
+**`MOD-B02-WALKIN`**: phone → if existing, profile auto-fills (duplicate detection by phone, `FR-REC-20`); else quick-create (name, age, sex). Position: শেষে যোগ (default) or নির্দিষ্ট অবস্থানে (reason required). Confirm → `EVT-WALKIN_ADDED` → token print (`FR-REC-21`).
+
+> **Built in pilot step 23**, with `W` as its key. The finder lists everybody registered under the number (a household shares one phone) with **বেছে নিন** on each; nobody, or somebody new, is four fields under it. The serial comes back in the toast ("… সিরিয়াল ৫ দেওয়া হয়েছে"); the row arrives on the session channel. **Online only**: a serial issued offline by two counters could be the same number, so offline the button is switched off with "সিরিয়াল দিতে ইন্টারনেট সংযোগ লাগবে". **The printed token slip (`FR-REC-21`) is not built** — the serial is said at the counter and shown on the queue.
+
+### B1.5 Right column
+
+| Element | ID | Wiring |
+|---|---|---|
+| Now-serving card | — | Serial, name, elapsed time in chamber, waiting count, current rate |
+| Today counters | — | Seen / waiting / late / no-show / average wait, live |
+| Waitlist recovery card | `BTN-B02-OFFER` | Appears when a slot frees → "৩ জনকে প্রস্তাব পাঠান" → `EVT-SLOT_OFFERED` → standby patients receive a timed offer; acceptance appears here (`FR-REC-30`) |
+| Broadcast log | — | Last few notifications sent with channel counts ("১৮ জনকে জানানো হয়েছে — অ্যাপ ১১, এসএমএস ৭") |
+| Offline block | — | Status + pending-event count + last sync time; clicking shows the pending list (`FR-OFF-01`). When the server has answered and could not take some actions it says how many, with আবার পাঠান (send again) and বাদ দিন (discard, after a confirmation, `GR-01`); when the browser cannot keep the outbox across a reload it says so (`FR-OFF-05`). After a reload with no network the console opens on the queue this device was last told, with this block saying it is offline and the freshness line giving its age; names are absent until the connection returns |
+
+### B1.6 Registration & billing screens
+
+`S-B-03` Registration: phone-first search → existing patient or create → optional NID → save → immediate booking option.
+
+> **Built in pilot step 23; redesigned in Phase 8B Batch 3B:** `/?view=registration` uses **Mobile number → Patient → Doctor/Chamber → Serial confirmation**, reusing the counter finder and the existing write endpoints. Valid V1 phone formats search automatically, with an explicit retry. Household members remain separate; choosing an existing person opens inline demographic confirmation. Duplicate-name warnings and indistinguishable identity stops never merge or overwrite people. A new patient needs the existing name, age (0–130) and sex; **NID is not asked for** because its encryption is not implemented and `FR-REC-20` does not need it. Patient-profile creation remains separate from queue insertion. The canonical registration receipt identifies a reused record after concurrent creation or an uncertain answer; it requires confirmation rather than presenting the typed demographics as that record.
+
+> The selected authorised desk filters today's chamber choices. An individual Reception queue links to `/?view=registration&from=<session-id>`: only that authorised chamber is offered, preselected with an obvious return link. Missing/revoked context supplies no substitute; ended/cancelled chambers are explained and disabled, while the existing server guard still refuses stale writes. A summary describes the intended end-of-queue insertion without predicting a serial. Only the actual walk-in receipt opens the large serial confirmation, patient/chamber summary, Next patient and Return to queue. Next patient clears the standalone chamber selection; an originating queue retains its context. Positioned/reasoned insertion remains available in Reception's existing walk-in sheet.
+
+> Loading/empty/failed/offline states retain entered information. Serial issuance and patient lookup/creation remain online-only. Incomplete forms ask before destructive reset or in-app navigation and use the browser's leave warning; Help/language changes preserve work. Pending submission blocks repeats. Uncertain writes retain their original request and patient/chamber target until authoritative retry returns a result. A profile receipt is never a serial receipt. There is no new printing, billing, durable patient-form storage or offline serial allocation in this batch.
+`S-B-04` Billing: collect fee, method, print/SMS receipt (`FR-REC-22`); shift reconciliation view with expected vs collected and a variance note field (`FR-REC-23`).
+
+---
+
+## B2. Doctor console — `S-B-05`
+
+**Phase 8B Batch 4B presentation:** the real workspace uses the shared hospital-branded header, compact read-only chamber queue (a drawer on tablets), pinned patient identity/allergy strip, history beside numbered consultation sections, and persistent Save Draft / Sign & Next controls. Bangla/English and contextual Help keep the same mounted editor. Queue identity and ordering come from existing authorised reads; the patient strip and history describe the encounter being edited even when Reception has moved the live queue. Unknown allergies are distinct from declared none.
+
+Follow-up offers none, 7/14/30 days and Custom (1–365 whole days, Bangla or Latin numerals). The preview is a Bangladesh calendar date, persisted through the existing date-only visit field. After acknowledgement the exact stored date stays visible; sign review and server-record printing use that date. Invalid custom input blocks signing but other valid notes can be saved: the follow-up date is cleared, its exclusion is disclosed, and the raw invalid input remains locally visible. Leaving that input for a new patient requires explicit discard. No appointment or reminder is created. Saving/signing/failed/unsaved/excluded/signed states are distinguished; an uncertain draft save must be retried before signing.
+
+Sign & Next opens a confirmation of the pinned patient, encounter and record. It captures the reviewed calendar date so crossing Bangladesh midnight before confirmation cannot change the filed follow-up. A queue change during review blocks a fresh confirmation. The dialog describes the conditional queue effect without promising a particular next patient; only backend receipts establish signature and queue outcomes. The existing 30-minute delay now asks for confirmation; no arbitrary duration is added. See the [integrated Doctor review](design/console-doctor/README.md) and [retained safety contract](design/console-doctor-safety/README.md).
+
+> **Built in this version:** the session header, `BTN-B05-DELAY`, the patient
+> panel, `INP-B05-DX`, `INP-B05-ADVICE`, `SEL-B05-FOLLOWUP`, `BTN-B05-DRAFT`,
+> `BTN-B05-SIGN`, `BTN-B05-TEST` (step 17), and since plan R2 `TBL-B05-RX`,
+> `BTN-B05-ADDRX` and printing (`BTN-B05-PRINT`).
+>
+> **Prescribing (plan R2, `PRD.md` §9).** `BTN-B05-ADDRX` adds a row to
+> `TBL-B05-RX`; the name field suggests from the formulary as the doctor types
+> (`GET /formulary?q=`, two letters or more) and takes a name it does not
+> carry. A row with no name is not sent; one with a schedule the notation does
+> not allow says so under the field and holds the save. Rows go with
+> `BTN-B05-DRAFT` and `BTN-B05-SIGN` as part of the visit. Signing moves the
+> chamber to the next patient, so the visit just signed stays offered as
+> **শেষ প্রেসক্রিপশন প্রিন্ট** (`BTN-B05-PRINT`) until the next one is signed:
+> it reads the signed record back from the server and prints that, never the
+> screen's copy. A past visit with medicines in the patient panel offers the
+> same print.
+>
+> `BTN-B05-SCAN` is built as a **pasted code, not a camera**: the doctor enters
+> the code `BTN-A12-QR` shows, and the patient's earlier visits open beneath
+> the patient panel. The card clears when the next patient is called, so a
+> consented history is never read as the next person's. A QR encoder and
+> scanner are dependencies not yet agreed; the endpoint does not change.
+>
+> `BTN-B05-NEXT` is absent too, and deliberately: `BTN-B05-SIGN` already
+> finishes the patient and calls the next one, so a second control doing half of
+> that would give a doctor two ways to end a consultation and one of them would
+> lose the record.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Session header | — | Seen / waiting / average duration / running late indicator |
+| দেরি জানান | `BTN-B05-DELAY` | Same effect as reception's delay, initiated by the doctor (`FR-DOC-02`) |
+| পরবর্তী রোগী | `BTN-B05-NEXT` | Same event chain as `BTN-B02-NEXT`; serialised server-side against reception (`FR-QUE-53`) |
+| Patient panel | — | Pre-visit intake, chronic conditions, allergies, last visits, previous prescriptions, recent results (`FR-DOC-03`) |
+| QR scan | `BTN-B05-SCAN` | Opens camera to scan the patient's wallet QR; consent recorded, access logged (`FR-PAT-63`, `FR-SEC-03`) |
+| Diagnosis field | `INP-B05-DX` | Autocomplete over ICD-ish common terms, free text allowed |
+| Medicine rows | `TBL-B05-RX` | Name (autocomplete over formulary, `FR-DOC-05`), strength, schedule (1+0+1), duration, instruction |
+| + ওষুধ | `BTN-B05-ADDRX` | Adds a row; keyboard-first entry |
+| Test chips | `BTN-B05-TEST` | Adds test orders → pushed to lab queue on save (`FR-DOC-06`). The chips are the hospital's own catalogue (`GET /lab/catalogue`), so the name and price a doctor ticks are the ones the lab and the wallet show. Ticking writes nothing: the orders go with the record, because an order hangs off the visit and there is no visit until it is filed |
+| Advice box | `INP-B05-ADVICE` | Printed in Bangla for the patient (`FR-DOC-07`) |
+| Public health signal | `CHIP-B05-SIGNAL` | কোনোটি নয় / ডেঙ্গু / ডায়রিয়া / জ্বর — one or none, "none" first and selected by default. Filed with the visit as `visits.symptom_signal` and counted by district only (`FR-GOV-03`, `v_gov_symptom_daily`). Not a diagnosis and not shown in the patient's wallet: `INP-B05-DX` stays the record. Added at step 20, because a spike needs a category to count and nothing else in the product records one |
+| Follow-up | `SEL-B05-FOLLOWUP` | None, 7/14/30 days or Custom 1–365 → Bangladesh calendar date in the existing visit field; invalid custom blocks signing and is explicitly excluded/cleared on draft save. V1 creates no reminder (`FR-PAT-80` remains unbuilt) or appointment |
+| খসড়া রাখুন | `BTN-B05-DRAFT` | Saves without finishing the consultation |
+| **রেকর্ড দিন ও পরবর্তী** | `BTN-B05-SIGN` | Signs the visit and its medicines → writes the record to the patient wallet → `EVT-PATIENT_DONE` + `EVT-PATIENT_CALLED` for the next patient (`FR-DOC-08`) |
+| শেষ প্রেসক্রিপশন প্রিন্ট | `BTN-B05-PRINT` | The visit last signed here, read back from the server → the Bangla sheet → the browser's print (`FR-DOC-07`, plan R2) |
+
+**Failure handling (`FR-DOC-08`, Phase 8B Batch 4A):** the editor owns the original session/booking/patient independently of reception's live queue. Socket updates/reconnects do not clear or reassign writing. If reception changes patient, keep the original patient panel and note, explain the change and block a fresh Sign & Next; the doctor explicitly saves to that old booking or confirms discarding before opening the current patient. Failed saves retain fields. Authorised server drafts hydrate before writing is enabled, never over local edits or a newer save. Newer server revisions require explicit review; unsigned clinical writing is never placed in localStorage, sessionStorage, IndexedDB or the offline outbox. Native reload/close warns about unfinished/uncertain work; a forced close/crash still loses unsaved memory.
+
+Signing freezes identity/body/key, blocks overlapping submissions, and checks the backend receipt before declaring any signature. An uncertain network reply offers **Check signing and queue result** using that same attempt, even when reception moved on. Confirmed signatures and queue changes/failures are reported separately. The backend checks current encounter and draft revision under the existing session lock, commits the immutable record first, then performs a queue operation restricted to the signed booking; replay precedes stale-state guards. A different existing signature never causes silent discard of this device's writing. Confirmed complete signing refreshes through the existing sequence-aware queue hook before releasing the editor. Failed test-order requests remain independently bound to their original booking/codes/key for retry, even after opening another patient. Draft-time test ordering, consent rules and server-record prescription printing remain as before. Test-code selection is not a persisted clinical-draft field.
+
+---
+
+## B3. Ward / bed board — `S-B-06`
+
+> **Built in this version** (step 14): every control below. Opened from the
+> picker's ward section at `/?view=ward` — the ward belongs to a hospital, not
+> a chamber.
+>
+> - **Tiles name no patient.** Opening an occupied bed's panel shows who is in
+>   it and writes `audit_log` (`DB-P7`); so does reading `LIST-B06-PENDING`.
+> - **`BTN-B06-DISCHARGE`'s "timer → then free" is a person, not a clock.** The
+>   cleaning tile shows how long it has been cleaning; `পরিষ্কার শেষ করুন`
+>   frees it. A bed that freed itself would be a free bed nobody looked at.
+> - **Admit** takes a pending request, or the person at the desk by name, phone,
+>   age and sex (an existing record with the same name and phone is reused).
+>   There is no free-text patient search: a ward that could look anyone up by
+>   phone would read records of people who never came here (DATABASE.md §5).
+> - **"Two taps at most"** (`FR-BED-02`) is counted from the open panel: a hold
+>   is one tap on its length; discharge and transfer are the action and the
+>   `GR-01` confirmation.
+> - **`BTN-B06-RESERVE`'s "expiry auto-releases"** needs no timer: a lapsed hold
+>   counts as free to the public at once, and the logged `RELEASE` (by nobody)
+>   is written the next time the board or the pending list is read.
+> - **`LIST-B06-PENDING`** carries app requests and, since step 15, the ER's
+>   handoffs (`BTN-B07-ADMIT`) by token and problem. Choosing a bed for one opens
+>   that bed's admit form with the case chosen, age and sex filled in from the ER,
+>   and the name and phone taken there. Hold reserves a real bed of the kind asked for.
+> - **Offline** (`FR-OFF-01`): every bed change is queued, shown with a clock on
+>   its tile, and sent in order on reconnect; the mirror shows the difference
+>   between the board and what the public still sees. The patient's name and
+>   the pending list need the connection — both are audited reads.
+> - `SEL-B06-EXPDIS` feeds a staff-only "likely free tomorrow" card; the
+>   forecast is never published.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Floor/ward tabs | `TAB-B06-<ward>` | Filters the board |
+| Bed tile | `BTN-B06-BED-<bedId>` | Opens the right-side bed panel |
+| Bed panel: ভর্তি করুন | `BTN-B06-ADMIT` | Patient search or from pending list → admit → `EVT-BED_OCCUPIED` → public counters drop by one instantly (`FR-BED-02`) |
+| Bed panel: ছাড়পত্র | `BTN-B06-DISCHARGE` | Confirm → bed enters *cleaning* state with a timer → then *free* |
+| Bed panel: স্থানান্তর | `BTN-B06-TRANSFER` | Choose target bed → both tiles update |
+| Bed panel: সংরক্ষিত রাখুন | `BTN-B06-RESERVE` | Hold with expiry; expiry auto-releases and logs |
+| Bed panel: সেবার বাইরে | `BTN-B06-OOS` | Marks out of service with reason |
+| Expected discharge | `SEL-B06-EXPDIS` | Sets date → feeds tomorrow's predicted availability (`FR-BED-04`) |
+| "অ্যাপে দেখাচ্ছে" card | — | Mirrors the public numbers and their freshness, so staff see the consequence of not updating (`FR-BED-06`) |
+| Pending admissions | `LIST-B06-PENDING` | From ER and from app bed requests; accept → admit flow; decline → notifies patient |
+
+---
+
+## B4. Emergency console — `S-B-07`
+
+> **Built in this version** (step 15; referrals step 16), opened from the
+> picker's ER section at `/?view=er`. Not built: `INP-B07-BLOOD` (`FR-EMG-06` —
+> no table holds blood stock yet; it arrives with step 17's blood work).
+>
+> - **Prepare / accept / decline.** প্রস্তুতি নিন acknowledges and the family is
+>   told (screen, and SMS if a number was left). গ্রহণ করুন means *the person is
+>   here*: they are given a token (`ER-<n>`) and join the triage list. ফিরিয়ে দিন
+>   needs a reason and opens the other ERs for that capability, ranked from this
+>   hospital, each with its number to call. That list stays a suggestion, not a
+>   referral (owner's ruling, 2026-09-22): a decline is before arrival, the
+>   family chooses where to go, and nothing on the family's side follows a
+>   referral — so a referral of someone still on the road would prepare a
+>   hospital for a family nobody told.
+> - **Referrals are for someone in this ER** (`FR-EMG-07..09`). রেফার খুঁজুন on a
+>   triage row opens the refer-out search: what the case needs defaults from
+>   the problem (burn → burn unit and a burn bed) and the coordinator can name a
+>   capability, a kind of free bed, or both — "our ICU is full" is a bed. The
+>   list keeps ERs with that capability and a free bed, ranked as the family's
+>   search is (fresh before stale, then travel time), each with its freshness
+>   line, and says how many it left out and why. রেফার পাঠান sends the case's
+>   problem, colour, age and sex and an optional note; never a name or number.
+> - **The sender holds the person until the receiver says they arrived**
+>   (owner's ruling). The row shows where the referral has got to — sent, seen,
+>   accepted, declined with its reason — and ভর্তি করুন and ছেড়ে দিন say why they
+>   are held while it is open. রেফার প্রত্যাহার করুন withdraws it.
+> - **The receiving ER** hears a new referral ring and sees it in অন্য হাসপাতাল
+>   পাঠাতে চায় (`LIST-B07-IN`) as the emergency colour until answered. The first
+>   touch tells the sender it was seen. রাজি — পাঠাতে বলুন accepts; ফিরিয়ে দিন
+>   needs a reason; once accepted, এসে পৌঁছেছেন gives the person a token here and
+>   closes the case at the sending ER, both lists changing together.
+> - **Today's referrals**, in and out, each with its whole timeline, sit in the
+>   right column.
+> - **The alert** rings (Web Audio) and stays the emergency colour until
+>   answered; when the browser has muted sound, the console says so and offers
+>   the one tap that unmutes it.
+> - **Names nobody.** A caller's number is fetched when ফোন করুন is tapped, and
+>   that read writes `audit_log` (`DB-P7`).
+> - **Two controls this table did not list**, both needed by what it does list:
+>   `BTN-B07-WALKIN` নতুন রোগী যোগ করুন (walk-in registration, BACKEND.md §7.5's
+>   `POST /emergency/cases` — the triage list needs a way in besides the app),
+>   and `BTN-B07-DISCHARGE` ছেড়ে দিন (seen and sent home, behind a `GR-01`
+>   confirmation — without it `FR-EMG-04`'s load could only grow).
+> - **Triage order**: red, then the untriaged, then yellow, then green; longest
+>   waiting first within each.
+> - **Capability switches** publish their own row at once; সব ঠিক আছে — নিশ্চিত
+>   করুন re-sends the list to renew its age.
+> - **Offline** (`FR-OFF-01`): every action is queued, applied on screen, counted
+>   in the offline block and sent in order on reconnect — referral steps
+>   included. New alerts and new referrals cannot arrive offline, and the
+>   refer-out search needs the connection; the console says so.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Inbound alert card | `CARD-B07-<caseId>` | Audible + visual alert on arrival (`FR-EMG-01`) |
+| প্রস্তুতি নিন | `BTN-B07-PREPARE` | Acknowledges → patient's app shows "হাসপাতাল প্রস্তুত" |
+| গ্রহণ করুন | `BTN-B07-ACCEPT` | Creates an ER case record |
+| ফিরিয়ে দিন | `BTN-B07-DECLINE` | Requires reason → immediately opens refer-out search for that capability (`FR-EMG-02`) |
+| Triage list | `TBL-B07-TRIAGE` | Token, patient, complaint, arrival, colour (red/yellow/green), actions |
+| Colour set | `BTN-B07-TRIAGE-<c>` | Sets triage category; red rows pin to top |
+| ভর্তি করুন | `BTN-B07-ADMIT` | Hands off to ward board with the case attached |
+| নতুন রোগী যোগ করুন | `BTN-B07-WALKIN` | Walk-in registration: problem (required), triage, age, sex, phone → a token and a row on the triage list |
+| ছেড়ে দিন | `BTN-B07-DISCHARGE` | Confirm → the case closes and leaves the load (`FR-EMG-04`) |
+| Capability toggles | `SW-B07-<capability>` | Burn / cardiac / stroke / dialysis / NICU / trauma OT → publishes to the emergency network within seconds (`FR-EMG-05`) |
+| ICU/bed counters | — | Read from the bed board, not typed twice |
+| Blood stock | `INP-B07-BLOOD-<group>` | Availability level, not exact counts, if the hospital prefers (`FR-EMG-06`) |
+| রেফার খুঁজুন | `BTN-B07-REFER` | Search other hospitals by required capability + free bed, ranked by travel time, each with freshness (`FR-EMG-07`). On a triage row, not while a referral of the case is open |
+| রেফার পাঠান | `BTN-B07-REFER-SEND-<id>` | Sends patient summary → target console receives accept/decline → timeline recorded: sent → seen → accepted → arrived (`FR-EMG-08`) |
+| রেফার প্রত্যাহার করুন | `BTN-B07-REFER-CANCEL` | Sender withdraws before arrival, behind a `GR-01` confirmation that names the receiving ER; not in the original table, needed because one open referral per case would otherwise leave an unanswered one stuck |
+| Incoming referrals | `LIST-B07-IN` | Accept / decline with reason (`FR-EMG-09`). The first touch stamps *seen* |
+| রাজি — পাঠাতে বলুন | `BTN-B07-IN-ACCEPT` | Accept → the sender's row says accepted; the person is still the sender's |
+| ফিরিয়ে দিন | `BTN-B07-IN-DECLINE` | Reason required (`GR-01`) → the sender's row shows it, and the case is theirs to refer elsewhere |
+| এসে পৌঁছেছেন | `BTN-B07-IN-ARRIVED` | The handover: a token here, the sending case closed as referred |
+| Today's referrals | — | In and out, each with its timeline (`FR-EMG-08`) |
+
+---
+
+## B5. Lab & pharmacy consoles
+
+> **Built in this version** (step 17): the whole of `S-B-08`, and the stock
+> half of `S-B-09`. Both are opened from `S-B-01` on the hospital rather than
+> on a chamber, as the ward board and the ER are, and only at a facility whose
+> roster has that role — a diagnostic centre gets a lab and no pharmacy, a
+> clinic the reverse.
+>
+> **Not built:** `S-B-09`'s scanner and dispensing (`FR-PHR-01`). Prescribing
+> is out of scope for this version (`PRD.md` §9, §12), so nothing writes a
+> `prescriptions` row and there is nothing to scan. The screen says so in a
+> sentence instead of opening a camera onto an empty table.
+
+**`S-B-08` Lab**: order queue → state buttons (`নমুনা নেওয়া হয়েছে` → `প্রসেসিং` → `রিপোর্ট প্রস্তুত`) → upload report file → auto-delivery to patient wallet and ordering doctor (`FR-LAB-02`, `FR-LAB-03`). Turnaround timer visible per order.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Queue filter | `CHIP-B08-<state>` | চলমান / রিপোর্ট হয়েছে / সব. Open orders sort oldest first — a turnaround clock is running on each (`FR-LAB-04`) |
+| Order row | `CARD-B08-<orderId>` | Test, state, when it was ordered, how long it has been waiting. **No patient name** |
+| রোগীর নাম দেখুন | `BTN-B08-PATIENT` | Fetches the name through an audited read; one tap, recorded (`DB-P7`, `FR-SEC-03`) |
+| নমুনা নেওয়া হয়েছে | `BTN-B08-COLLECT` | → `sample_collected`, stamps `sample_at` |
+| প্রসেসিং | `BTN-B08-PROCESS` | → `processing` |
+| রিপোর্ট দিন | `BTN-B08-UPLOAD` | PDF or image → stored → order `delivered` → wallet and ordering doctor, in one transaction. There is no separate *send*: uploading **is** delivering (`FR-LAB-03`) |
+| বাতিল করুন | `BTN-B08-CANCEL` | Only while the lab still has work. A test with a report cannot be cancelled — the result is the patient's |
+| Turnaround panel | — | Median per test type, slowest beside it, and the count still open. A type with no finished order says so rather than reading zero (`FR-LAB-04`) |
+
+**The lifecycle only moves forward.** A mis-tap is corrected by cancelling and re-ordering, which leaves both rows visible, never by walking an order back: the timestamps are the turnaround measurement, and a measurement that can be edited is not one. `delivered` is the server's own step and is not a button a console may send.
+
+**`S-B-09` Pharmacy**: scan prescription QR → line items with stock status → dispense (full or partial) → record → out-of-stock flag feeds public medicine search (`FR-PHR-01`, `FR-PHR-02`).
+
+| Element | ID | Wiring |
+|---|---|---|
+| Stock row | `ROW-B09-<medicineId>` | The medicine, what this counter last said, **and what a patient searching is being shown right now**, with its age |
+| আছে / নেই | `BTN-B09-IN` / `BTN-B09-OUT` | Sets the flag and renews its freshness (`FR-PHR-02`) |
+| পুরো তালিকা ঠিক আছে | `BTN-B09-CONFIRM-ALL` | Re-sends every flag unchanged. This is how somebody says "still true", and it is the commonest act at this counter |
+
+**A flag that nobody renews goes quiet on its own.** After twelve hours an in-stock claim is published as *জানা নেই* rather than repeated; an out-of-stock flag stands until somebody clears it, because a pharmacy that restocked has every reason to say so and one that has run out has none to keep saying it. The row showing what the public sees is `FR-BED-06`'s idea applied to a shelf: the consequence of not renewing is visible to the person who would renew it.
+
+---
+
+## B6. Hospital admin — `S-B-10`
+
+**Phase 8B Batch 5A:** the shared branded workspace has five entries: Today, Reports, Staff & Desks, Doctors and Settings. Today opens first with five operational tiles, recorded attention signals, today's chambers grouped by existing desks, and today's V1 figures. `GET /admin/overview` now adds up to 250 chambers in one set-based query under the existing hospital-admin/own-hospital gate; no patient names or clinical details. Cancelled/ended states remain visible, multi-desk membership is explained, and truncation is explicit. Snapshot time and one-minute polling are visible; failed reads keep older information with a warning. Attention explains overdue starts, paused queues, missing room/desk assignments and old bed information; links inspect a row or open existing settings, without intervention APIs.
+
+Reports retains all nine V1 categories and Today / 7 / 30 / 90-day inclusive Bangladesh periods (30 days initially). Every metric, original snapshot/live-read distinction, unavailable value and report limitation is retained. The displayed period describes loaded data even when another period fails. CSV exports that period, with all four Revenue breakdowns accessible; print includes only the selected report, period and timestamps. Both date bounds use one captured clock. Staff & Desks, Doctors and Settings open the existing `S-B-11` panes (`tab=staff`, `doctors`, `profile`) without changing writes; their redesign waits for Batch 5B. See [the actual React review package](design/console-admin/README.md).
+
+| Section | Controls | Wiring |
+|---|---|---|
+| Now | `CARD-B10-NOW` | Above everything else (`FR-ADM-12`, plan R6): five tiles — doctors (sitting of scheduled), waiting, appointments (seen of booked), beds (free of in service, with the ward's age), emergency (on the way · in the ER). `GET /admin/overview`, read on opening and every minute; one freshness line for the panel, the beds' own age under their tile; a tile with nothing to know says so |
+| Overview report | Date range selector | Existing daily snapshot KPIs (`FR-ADM-01`); no unsupported department filter |
+| Trends | Wait-time chart with adoption marker | `FR-ADM-02` |
+| Loss & recovery | No-show taka value, recovered value | `FR-ADM-03` |
+| Revenue | By doctor / department / service / method | `FR-ADM-04` |
+| Staff | Doctor punctuality, consultation duration | `FR-ADM-05` |
+| Beds | Utilisation, ALOS, turnover | `FR-ADM-06` |
+| Referrals | Sent / received / accepted / leaked | `FR-ADM-07` |
+| Feedback | Scores, complaint categories, response time | `FR-ADM-08` |
+| Export | `BTN-B10-EXPORT` | CSV / PDF (`FR-ADM-10`) |
+
+**`S-B-11` Hospital settings**: departments, doctors (with BMDC verification status), sessions and recurrence, fees, counters, beds and wards, capabilities, notification budget, no-show grace period, refund policy, staff users and roles (`FR-ADM-11`).
+
+Built in pilot step 22 (`FR-SUP-01`), opened by `LNK-B10-SETTINGS` in the dashboard's header (`/?view=settings`). The tabs follow the onboarding order in B6; above them, a status card says whether patients can see the facility, counts what is set up, and carries `BTN-B11-GOLIVE`.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Status card and checklist | `BTN-B11-REVIEW` (was `BTN-B11-GOLIVE`) | **A hospital does not publish itself (V3.1, `FR-ONB-02`–`04`).** The card says the workspace's state in a sentence (setting up; review requested; live; suspended; closed), shows the platform's note when it was sent back or suspended, and lists the checklist — departments, doctors, weekly chambers, staff (required), beds (optional), verified doctors (the platform's part) — each with its count and the word আছে / বাকি / ঐচ্ছিক / প্ল্যাটফর্ম যাচাই করবে. While something required is missing the button is off and a line names what to add. **পর্যালোচনার অনুরোধ করুন** → `POST /hospital/request-review` → the card reads "review requested" and the button is gone; nothing is public until a platform administrator approves on `S-B-12`. Only verified doctors are then shown to patients |
+| Facility | `FRM-B11-PROFILE`, `FRM-B11-RULES` | `PATCH /hospital/profile` (names, address, phones, coordinates both-or-neither); `PATCH /hospital/rules` (no-show grace in patients and minutes, late re-insert, stale threshold, SMS a month, and since plan H3 the **payment hold** in minutes, 5 to 60, fifteen by default, shown only where online payment is offered: how long a serial waits for its online payment, `FR-PAY-08`). **This month's SMS** (`TXT-B11-SMS`, `FR-NOT-06`, plan H2), under the rules form: `GET /hospital/messages` → five plain lines, **পাঠানো হয়েছে** (as **<cap>-এর মধ্যে <sent>** where a cap is set), **রোগীর ফোনে পৌঁছেছে**, **পাঠানো যায়নি**, **আটকে রাখা হয়েছে**, **এখনো অপেক্ষায়**, with what held back and waiting mean and when it was read (`<FreshnessLine>`). Where the SMS service reports no delivery the second line reads **এই এসএমএস সেবা পৌঁছানোর খবর দেয় না** and shows no number. States: the shape of the lines while loading; a sentence and a retry when it could not be read, saying so when the cause is no connection; offline with figures already on screen, they stay with their age |
+| Reception desks (`FR-REC-32`, plan R4) | `FRM-B11-DESKS` (`BTN-B11-DESK-ADD`, `CHIP-B11-DESK-DOCTOR`, `BTN-B11-DESK-SAVE`, `BTN-B11-DESK-REMOVE`) | On the staff tab: each desk with its names, a chip for every doctor of the hospital, ticked when the desk looks after them, and since question 20 a chip for every receptionist (`CHIP-B11-DESK-STAFF`), ticked when they work at it; saved per desk; removed after asking twice (kept as removed, which frees its receptionists). A line under the heading: a receptionist at a desk manages only its doctors; with no desks, everyone manages every chamber. `GET`/`POST /hospital/desks`, `PATCH`/`DELETE /hospital/desks/:id` |
+| Facility: what the network is told (`FR-NET-04`, plan C5) | `FRM-B11-PUBLISHING` (`CHIP-B11-PUBLISH-serials`, `CHIP-B11-PUBLISH-beds`, `CHIP-B11-PUBLISH-stock`, `BTN-B11-PUBLISHING-SAVE`) | Under the colours. One switch for each live figure the hospital has: open serials and who is sitting, free beds and ICU, which medicines the pharmacy has. A figure whose module the hospital does not run has no switch (`FR-BRD-11`). On is shared, and each switch says its state in words beside it. Save → `PUT /hospital/publishing` with the figures switched off; off with the reason while nothing has changed or the console is offline. A line under the switches says what cannot be switched: what the emergency department can treat is always shown. Result, in the patient app (`S-A-07`, `S-A-07s`, `S-A-05h`, `S-A-07b`, `S-A-11`, `S-A-10b`): where the figure would have been, a neutral chip says it is not shared (সিরিয়ালের সংখ্যা জানানো হয়নি, বেডের সংখ্যা জানানো হয়নি), with no number and no freshness line, never a zero or "none". The hospital stays in every list it was in: its doctors and when they sit, its chambers to book (a full one still says full), and a bed search for a kind it has, where its card says the count is not shared and still takes a request. A pharmacy that keeps its shelf is not named by the medicine search. Failure: a refusal leaves the switches as saved |
+| Facility: what patients see (`FR-BRD-06`, plan C1) | `FRM-B11-DESCRIPTION`, `FRM-B11-LOGO` (`BTN-B11-LOGO-SAVE`, `BTN-B11-LOGO-REMOVE`), `FRM-B11-BRAND` (`INP-B11-COLOUR`, `BTN-B11-BRAND-SAVE`, `BTN-B11-BRAND-RESET`) | Between the profile and the queue rules, each saved on its own. **Description**: two short texts, Bangla and English, counted as typed against 400 characters; too long is said before it is sent → `PATCH /hospital/profile`. **Logo**: a PNG, JPEG or WebP up to 256 KB (and, the helper says, a square PNG of at least 192 pixels if it is to be the icon of the installed portal, `FR-BRD-08`), refused on the screen with why if it is another kind or larger, previewed before it is saved → `PUT /hospital/logo`; remove → `DELETE /hospital/logo`. The screen shows the hospital's logo through its own route, because the public address answers for a live hospital only. **Colour**: one colour is chosen, not six; the screen makes the six brand tokens from it (`themeFromColour`), darkens a colour that cannot carry white text only as far as it must and says that it did, and shows a preview drawn with the app's own tokens → `PUT /hospital/brand`; **back to the platform's colours** → the same with `theme: null`. A set the server finds unreadable is refused and nothing changes. **Portal address** (`FR-BRD-07`): above them, read-only, where patients reach this hospital's own portal: under the platform's domain and, if the platform has recorded one, at the hospital's own domain; nothing on a deployment with no domain. Result: the hospital's card and page in the patient app carry its logo and its words, and its own portal is in its colour with its logo in the header (`S-A-02`, `S-A-07`, `S-A-05h`). Failure: offline, every save is off with the reason, as elsewhere on this screen |
+| Facility: what it was registered as (plan D2) | `FRM-B11-IDENTITY` (`CHIP-B11-DIVISION-<division>`, `INP-B11-DISTRICT`, `INP-B11-REGISTRATION`, `BTN-B11-IDENTITY-SAVE`) | Under the facility's details, its own form. Division, district and the licence or registration number: what the platform checks before approving and what a patient's search is filed under. **While the workspace is setting up** they are the hospital's to correct (a typo on an application is found here) → `PATCH /hospital/profile`. **Once review has been asked for** the form is gone and one line shows the three, saying they cannot be changed here and to tell the platform; the server refuses them whatever is sent (`identity_after_review`). A workspace sent back is setting up again |
+| Departments | `FRM-B11-DEPT`; per row `BTN-B11-DEPT-EDIT`, `FRM-B11-DEPT-EDIT`, `BTN-B11-DEPT-REMOVE` | `POST /hospital/departments` — names in both languages and a short code. **Each row (plan D2):** **সম্পাদনা** opens its two names in place → `PATCH /hospital/departments/:id` (the code does not change; **বাতিল** closes it and puts back what is saved). **সরান** is offered only while no doctor is listed under the department, and asks twice (**নিশ্চিত? এটি সরানো হবে।** → **হ্যাঁ, সরান** / **বাতিল**) → `DELETE /hospital/departments/:id`; its code is then free for the department that was meant. A department with doctors shows how many are listed and that it cannot be removed, in place of the button |
+| Doctors and chambers | `FRM-B11-DOCTOR`, `FRM-B11-FEE`, `BTN-B11-DOCTOR-ACTIVE`, `FRM-B11-SCHEDULE`, `BTN-B11-SCHEDULE-REMOVE` | `POST /hospital/doctors` (a known BMDC number is linked, and the toast says so); `PATCH /hospital/doctors/:id` (fee and room, with the note that bookings keep their fee; activate or deactivate); `POST /hospital/templates` → the chambers of the coming eight days, counted in the toast; `DELETE /hospital/templates/:id` → says how many booked chambers were kept for the counter |
+| Wards and beds: putting one right (plan D2) | `BTN-B11-WARD-EDIT`, `FRM-B11-WARD-EDIT`, `BTN-B11-WARD-REMOVE`; `CHIP-B11-BED-<label>`, `FRM-B11-BED` (`INP-B11-BED-LABEL`, `INP-B11-BED-NIGHTLY`, `BTN-B11-BED-SAVE`, `BTN-B11-BED-REMOVE`) | On each ward's card. **সম্পাদনা** opens its two names and its floor → `PATCH /hospital/wards/:id` (what kind of ward it is does not change; another ward's English name is refused with a sentence). **সরান** is offered only on a ward with no bed → `DELETE /hospital/wards/:id`. **A bed is chosen by its chip**, which opens its number and nightly charge → `PATCH /hospital/beds/:id`. Under them, one of two lines: the ward has not brought this bed into service yet, so if it was added by mistake it can be removed (**সরান**, asked twice → `DELETE /hospital/beds/:id`; its number is then free); or the ward has, so it cannot be removed here and is retired from the ward board (`BTN-B06-OOS`), where the reason is recorded. Under the chips, how many beds the ward has not yet brought into service. The server refuses a ward with beds (`ward_has_beds`) and a bed with any history (`bed_in_use`) whatever the screen offered |
+| Wards and beds | `FRM-B11-WARD`, `FRM-B11-BEDS` | `POST /hospital/wards`; `POST /hospital/beds` takes `301-320` or a comma list. New beds show out of service, "added in settings — not yet confirmed by the ward", until `BTN-B06-OOS`'s restore |
+| Emergency services | `FRM-B11-CAPABILITIES` | `PUT /hospital/capabilities`; each declared kind shows whether the ER last said it is available, with its `<FreshnessLine>` |
+| Staff | `FRM-B11-STAFF`, `BTN-B11-ROLES`, `BTN-B11-RESET`, `BTN-B11-STAFF-ACTIVE` | `POST /hospital/staff` → the temporary password on a card, once, to hand over in person; `PATCH /hospital/staff/:id` (roles, deactivate); `POST /hospital/staff/:id/reset-password`; `BTN-B11-RESET-2FA` → `POST /hospital/staff/:id/reset-2fa` (step 28), shown where two-step is on. Each row says **দুই ধাপ চালু**, or **দুই ধাপ বাকি** for an administrator without it. Reset and deactivate are not offered on one's own row |
+
+**Rules:** online only — with the connection gone the screen keeps the last snapshot under a banner, its freshness line ages, and every save is disabled with "saving needs a connection". A save always re-reads the snapshot.
+
+**The checklist also names what a patient needs to reach the place (plan D2):** an address and a phone number, a place on the map, and, where the hospital runs an emergency desk, the emergency services it has declared. Each reads **আছে** or **যোগ করা ভালো**, never **বাকি**: review can be asked for without them (`FR-ONB-03` lists what it waits for), and one line under the list says what a patient loses while they are absent. The platform's panel on `S-B-12` shows the same lines.
+
+**What this screen does not set, and why (audited in plan D2).** *Counters:* nothing in the product reads a list of counters (there is no table of them, and shift reconciliation per counter, `FR-REC-23`, is not built), so a list here would configure nothing; it is a question for the owner in `STATUS.md`. *The refund policy:* the agreed default stands until online payment is live. *Prepayment*, since plan F3, is on the rules form where online payment is offered: **অনলাইনে আগে পরিশোধ বাধ্যতামূলক** (`hospital_settings.prepay_required`: no serial is paid at the counter, `FR-PAY-02`) and **তিনবার অনুপস্থিত নম্বরে আগে পরিশোধ** with its window in days (`noshow_prepay`, `noshow_window_days`, `FR-GST-14`), both off by default. *A hospital's kind:* fixed when the workspace is made. *A doctor's department and specialties, and a weekly chamber's hours:* not changed in place; a chamber is removed and added again. *Removing a doctor:* a doctor is deactivated, not removed.
+
+---
+
+**`S-B-14` Import** (step 24, `PRD.md` §14b). Opened from `S-B-11` by a hospital administrator.
+
+| Element | ID | Wiring |
+|---|---|---|
+| Set | `SEL-B14-SET` | ক কাঠামো / খ রোগীর তালিকা / গ আগামী অ্যাপয়েন্টমেন্ট. ঘ is shown switched off with its reason (`FR-IMP-12`) |
+| Template | `BTN-B14-TEMPLATE` | Downloads the set's CSV template (`GET /hospital/imports/templates/:set`) |
+| File | `INP-B14-FILE` | A `.csv` file, read in the browser as UTF-8 text, or since plan E1 an Excel `.xlsx` file, read in the browser (`read-excel-file`, loaded only then) and written as that CSV (`FR-IMP-22`). An old `.xls` is named and not read (`importLegacyXls`); a file that cannot be read, or holds no rows, says so (`importUnreadable`); over 10 MB is refused before it is opened |
+| Sheet | `SEL-B14-SHEET` | Only for a workbook with more than one sheet holding rows: which is read, the first by default |
+| যাচাই করুন | `BTN-B14-CHECK` | First `POST /hospital/imports/analyse`. A file with the template's columns goes on to `POST /hospital/imports` → the preview, as before; nothing is written but the batch. **Any other file opens the mapping step below** (V4.1, `FR-IMP-13`). A file whose first row is data and not headings is stopped with a sentence, and the row is not shown (`FR-IMP-14`) |
+| Mapping step | `TBL-B14-MAP` | **The hospital's own export, matched to ours (`FR-IMP-15`–`18`).** One row per thing the import needs, not per column of the file: the field's name and an **আবশ্যক** mark, a select of the file's columns (`SEL-B14-MAP-<field>`, with **এই তথ্য নেওয়া হবে না**), under it what the chosen column was found to hold and how full it is, and beside it where the choice came from — নিয়ম থেকে প্রস্তাব / আগের নিশ্চিত করা মিল / এআইয়ের প্রস্তাব / আপনি বেছে নিয়েছেন — with how sure it is and why in a sentence. Changing a select makes the choice the administrator's. **No value from the file is shown here**; rows appear in the preview, after the check. Under the table: the file's columns that will not be imported, by name |
+| The model's part | `TXT-B14-MAP-MODEL` | Shown only when a model was asked (V4.2, `FR-IMP-16`, `FR-IMP-17`). When it suggested something: **"যেসব কলাম নিয়মে মেলেনি, সেগুলোর জন্য এআই প্রস্তাব দিয়েছে। এগুলো শুধু প্রস্তাব; দেখে তবেই নিশ্চিত করুন। ফাইলের কোনো সারি এআইকে পাঠানো হয়নি, শুধু কলামের নাম ও ধরন।"** Each field it suggested carries the chip **এআইয়ের প্রস্তাব**, how sure it is, and the model's own sentence of why; changing the select makes it the administrator's. When it could not answer: a quiet line that the rules and the administrator's own choices are enough, and the step works as it does with no model. A suggestion is never applied by itself: nothing proceeds until **মিল নিশ্চিত করে যাচাই করুন** |
+| What the file is a list of | `SEL-B14-MAP-TYPE` | Structure set only: বিভাগ / ডাক্তার / সাপ্তাহিক সময়সূচি / ওয়ার্ড / বেড / কর্মী. A hospital's export is one kind of thing per file; the server guesses from the headings and a tap corrects it (re-analyses) |
+| মিল নিশ্চিত করে যাচাই করুন | `BTN-B14-MAP-CONFIRM` | Off, with what is missing named, while a required field has no column. → `POST /hospital/imports/mapped` → the same preview as a template file. The mapping is saved for these headings; the next file with them opens already matched and says so (`FR-IMP-20`). বাতিল closes the step and saves nothing |
+| Preview | `TBL-B14-PREVIEW` | Four counts — যোগ, হালনাগাদ, বাদ, ভুল — then every error row: row number, field, reason in the chosen language |
+| Before approving | `TXT-B14-WARN` | Shown on the preview of a checked batch only when there is something to say (V4.3, `FR-IMP-21`), under **অনুমোদনের আগে দেখে নিন** and the line that these are not errors and do not stop the import. **The same patient more than once**: how many places, then each as its row numbers and why (**একই নাম ও মোবাইল নম্বর**, **একই নাম ও জন্ম তারিখ**), and that they will not be merged — each row is imported as a separate patient. At most fifty are listed and the rest counted. **A column written more than one way**: the field's name, each way found with how many rows, and the reading that will be used — a day/month/year date is read day first; every number is stored as `+8801…`. It names rows by number and shows nothing from them. It never disables **অনুমোদন করে সংরক্ষণ** |
+| অনুমোদন করে সংরক্ষণ | `BTN-B14-COMMIT` | Confirm (`GR-01`) → `POST …/commit`. Disabled while any row is an error |
+| বাতিল | `BTN-B14-DISCARD` | `POST …/discard` |
+| History | `TBL-B14-HISTORY` | Every batch: set, file, who, when, counts, state |
+| ফিরিয়ে নিন | `BTN-B14-UNDO` | On a committed batch: confirm → `POST …/undo`; a refusal lists the rows that stop it (`FR-IMP-07`) |
+
+**States:** loading, empty (no batch yet — the three templates are the call to action), error, offline (import needs the server; the screen says so and keeps the chosen file).
+
+> **Built in pilot step 24**, opened from `S-B-11`'s header (**পুরোনো তথ্য আমদানি করুন**, `/?view=imports`). Each set has a line saying what it takes and what it never does (no NID, no address). Errors are listed row by row with the column as the file names it and the reason in the reading language; **অনুমোদন করে সংরক্ষণ** stays switched off while any row is an error. A refused undo lists the row numbers that stop it. Template example rows (`ref` beginning `EXAMPLE`) are skipped, so a template imported as downloaded writes nothing. Accounts an import creates hold no password until an administrator issues one from `S-B-11`.
+
+---
+
+## B7. Platform super-admin — `S-B-12`
+
+Hospital onboarding wizard (steps: facility → departments → doctors → sessions → beds → capabilities → counters → staff → go live), doctor verification queue, feature flags, subscriptions and invoices, review moderation, system health (sync lag, stale-data offenders, notification delivery) — `FR-SUP-01`–`06`.
+
+> **In V1 this screen is onboarding** (`PRD.md` §14c, `FR-ONB-*`), **built in V3.1 (server) and V3.2 (screen)**. The wizard above is the hospital's own `S-B-11` with its checklist, not a second copy of it here. Since V1 completion it also carries a workspace's modules (`FR-SUP-03`, plan C4) and its agreement state and usage (`FR-SUP-04`, the state half, plan G1), and its health and trail of changes (`FR-SUP-06`, `FR-ONB-07`, plan G2). Invoicing and moderation wait (`FR-SUP-04`'s other half, `FR-SUP-05`).
+
+Opened by a platform administrator: on a demonstration from the picker's **প্ল্যাটফর্ম পরিচালনা** section (`BTN-B01-PLATFORM`, `/?view=platform`); on a real deployment by signing in as one (`pnpm staff:create --platform` makes a deployment's first, `DEPLOY.md` S3). A hospital's staff, its administrator included, cannot open it, and neither can a government viewer.
+
+Under the title, always: **"এখানে শুধু প্রতিষ্ঠান ও তাদের প্রস্তুতির হিসাব দেখা যায়। কোনো রোগীর তথ্য এখানে নেই।"** (`FR-ONB-08`).
+
+| Element | ID | Wiring |
+|---|---|---|
+| Workspace list | `LIST-B12` | `GET /platform/hospitals`. Those waiting for review first, oldest first, with how many are waiting above the list. Each row: name, kind, district, code, its state as a word (সেটআপ চলছে / পর্যালোচনার অপেক্ষায় / লাইভ / স্থগিত / বন্ধ), and its doctors, verified doctors and weekly chambers. A workspace the hospital applied for itself carries a chip, **নিজে আবেদন করেছে** (`CHIP-B12-APPLIED`, `FR-ONB-10`); one the platform made carries none. The list says when it was read (`<FreshnessLine>`) A workspace whose agreement is overdue or has ended carries a chip saying so (`CHIP-B12-AGREEMENT`, **চুক্তি বকেয়া** / **চুক্তি শেষ**, `FR-SUP-04`); trial and active, the ordinary states, are read on the workspace and not in the list. **Which hospital needs attention** (`FR-SUP-06`, plan G2): a chip on the row for a week in which a message failed or is still waiting (`CHIP-B12-ATTENTION-messages`, **বার্তা যায়নি**) and for a published figure nobody ever confirmed (`-unconfirmed_figures`, **তথ্য কখনো নিশ্চিত করা হয়নি**). **A stale figure is not a chip**: a row whose hospital is showing patients a stale figure carries a line under its counts (`TXT-B12-STALEST`), **সবচেয়ে পুরোনো প্রকাশিত তথ্য: <figure>, <age> আগের**, so that the worst can be read against the rest; a hospital with nothing stale has no such line |
+| Add a hospital | `BTN-B12-NEW` → `FORM-B12-NEW` | Name in Bangla and English, code (letters and digits, cannot be changed later), kind, division, district, registration or licence number (optional), the first administrator's name and email → `POST /platform/hospitals`. A code in use is refused with a sentence. On success the **temporary password is shown once**, with the instruction to hand it over in person; the workspace opens in "setting up" and nothing of it is public (`FR-ONB-01`) |
+| Workspace panel | `PANEL-B12-<hospitalId>` | `GET /platform/hospitals/:id`: its state, registration number, when review was asked for, the last note sent to the hospital, the same checklist the hospital sees over the same counts, its doctors, and its administrators' names and emails, with a mobile where one was given. For a workspace the hospital applied for, one more line (`TXT-B12-APPLIED`): that it applied by itself, the facility's phone and its registration number, which is what the person who rings it before approving needs (`FR-ONB-10`) |
+| Verify a doctor | `BTN-B12-VERIFY-<doctorId>` | Beside each unverified doctor, with the BMDC number to check against the register → `POST /platform/hospitals/:id/doctors/:doctorId/verify` (`FR-ONB-05`). The line above the list says to mark a doctor only after checking |
+| Decision | `BTN-B12-APPROVE` / `-SENDBACK` / `-SUSPEND` / `-REINSTATE` / `-CLOSE` | Only the acts allowed from the workspace's state are shown; while it is the hospital's move the panel says so. **While a workspace is setting up, closing it is the one act offered** (plan D1): the panel says it is the hospital's move, then that a workspace that should not go on, such as an application that is not from a real facility, can be closed with the reason. That is how an application is declined (`FR-ONB-10`); a workspace waiting for review can be closed the same way. **Approve** is off, with the missing items named, until the checklist's required items exist and one doctor is verified. **Send back**, **suspend** and **close** are off until a reason is written in `INP-B12-NOTE`; that reason is what the hospital's administrator reads on `S-B-11`. **Close** also needs `CHK-B12-CLOSE-SURE` ticked, because nothing reopens a closed workspace. Each → `POST /platform/hospitals/:id/<act>`; the panel and the list then show the new state. If somebody else answered first the panel says the state changed and shows the current one |
+| Portal address (`FR-BRD-07`, plan C2) | `FRM-B12-DOMAIN` (`INP-B12-DOMAIN`, `BTN-B12-DOMAIN-SAVE`, `BTN-B12-DOMAIN-REMOVE`) | In the workspace's panel, above the decisions. Shows the hospital's address under the platform's domain, which is its code and needs nothing done; on a deployment with no platform domain it says a portal is not opened by an address. **The hospital's own domain** is typed here once the hospital has pointed it at the platform → `POST /platform/hospitals/:id/domain` → the deployment answers for it from the next request (CORS, the socket, `GET /config`), audit `portal_domain`. Save is off with the reason when nothing is typed, when what is typed is already recorded, and offline. Refused, said in a sentence: a name under the platform's own domain; a domain another hospital has. Remove → the same with `domain: null`. The hospital reads its addresses on `S-B-11` (*what patients see*) and cannot change them there |
+| Modules (`FR-BRD-11`, `FR-SUP-03`, plan C4) | `FRM-B12-MODULES` (`CHIP-B12-MODULE-<module>`, `BTN-B12-MODULES-SAVE`) | In the workspace's panel, above the portal address. Eight switches: serials and reception, doctor's console, beds, emergency, lab, pharmacy, dashboard, data import; pressed means on. Switching serials off switches the doctor's console off with it, and switching the doctor's console on brings serials with it, on the screen, before anything is sent. Save is off with the reason when nothing changed, and offline → `PUT /platform/hospitals/:id/modules` with the whole list of what is off → audit `modules` → from the next request the hospital's staff are refused the module, it is gone from what the hospital publishes, and its consoles stop offering it. Nothing the hospital holds is deleted. **On the hospital's side:** `S-B-01` offers only the consoles of modules that are on (an administrator whose dashboard is off is offered settings instead); `S-B-11` has no tab for a module that is off (wards and beds; emergency services), no link to the dashboard or the import when those are off, and one line naming what is off and saying to ask the platform |
+| Agreement and usage (`FR-SUP-04`, the state half; plan G1) | `FRM-B12-AGREEMENT` (`CHIP-B12-AGREEMENT-<state>`, `INP-B12-AGREEMENT-NOTE`, `BTN-B12-AGREEMENT-SAVE`), `TXT-B12-USAGE` | In the workspace's panel, above the modules. A line says what is recorded now and when it was set, or that nobody has set it yet and a new hospital starts in trial. Four choices, one pressed: **পরীক্ষামূলক**, **সক্রিয়**, **বকেয়া**, **শেষ হয়েছে**; a note, optional, of three to five hundred characters, for whoever reads it next. Save is off with the reason when nothing changed, when a note is shorter than three characters, and offline → `PUT /platform/hospitals/:id/agreement` `{ state, note }` → audit `agreement_<state>` → the panel and the list show it. A state saved without a note clears the last note. **The line under the title says it is a record**: saving it switches nothing at the hospital, and taking a hospital out of the network is suspending it, below. There is no field for a plan or an amount, and the note's helper says not to write amounts. **Usage** (`TXT-B12-USAGE`), under the form: serials taken in the last thirty days, chambers held in the last thirty days, SMS sent this month, as three plain lines with when they were counted (`<FreshnessLine>`), and the sentence that these are counts and no patient or serial is shown (`FR-ONB-08`). Read with the workspace (`GET /platform/hospitals/:id`), not with the list |
+| Health (`FR-SUP-06`, plan G2) | `TXT-B12-HEALTH` | In the workspace's panel, under the agreement. Read with the workspace (`GET /platform/hospitals/:id`). First what asks for attention, as chips, or **এখন নজর দেওয়ার মতো কিছু নেই।** Then three blocks. **Published figures**: bed figures and emergency services, each **হালনাগাদ** or **পুরোনো** with its age, **কখনো নিশ্চিত করা হয়নি** for one with no age, **নেটওয়ার্কে দেখানো হয় না** for one the hospital keeps to itself (`FR-NET-04`); only the figures of modules it runs; and the line saying after how long a figure counts as stale and that a patient's screen uses the same rule. **Messages in the last seven days**: sent, failed, held back, still waiting, the share of attempts that went, and what held back means. **Work that arrived late in the last seven days**: how many actions, the longest delay, when the last one arrived, or a sentence that none did; and under it that this is a counter working offline and not a fault, that it needs looking at if it happens often, and that the delay is by the counter's own clock. All of it with when it was read (`<FreshnessLine>`). Counts only, nothing about a person (`FR-ONB-08`) |
+| Trail of changes (`FR-ONB-07`, plan G2) | `LIST-B12-TRAIL` (`BTN-B12-TRAIL-SHOW`, `BTN-B12-TRAIL-MORE`) | In the workspace's panel, above the decision. Not loaded with the workspace: **ইতিহাস দেখুন** → `GET /platform/hospitals/:id/audit` → the last fifty changes, newest first, eight drawn and the rest behind **আরও দেখুন**. Each line: what was done as a sentence, when, who did it, and **প্ল্যাটফর্ম** or **হাসপাতাল**. A change made on this screen while the trail is open is read into it. Settings, the workspace's state, imports and exports; nothing done for a patient is in it, and the line under the title says so. **States:** three blocks the shape of a line while it loads; **এখনো কিছু বদলানো হয়নি।** when there is none; a sentence and a retry when it could not be read; offline the button is off with the reason |
+
+**States (`GR-03`).** Loading: three blocks the shape of a row. No workspace yet: says so, and the form is one tap away. A list that could not be loaded: says that with a retry, never an empty platform. Offline: the list stays, every write is off with the reason.
+
+## B8. Government viewer — `S-B-13`
+
+Read-only national/district capacity map, ER load heat map, symptom spike signals, anonymised benchmarking. No drill-down to an identifiable patient exists in the UI or the API for this role (`FR-GOV-06`).
+
+> **Built in this version** (step 20): all four sections below, opened from
+> `S-B-01` as **জাতীয় ড্যাশবোর্ড খুলুন** — offered once, beside the hospitals
+> rather than on one, because a government viewer belongs to no facility
+> (`FR-ROLE-01`, `DATABASE.md` 0024). The API reads as `gov_reader`, a
+> database role that can open the six `v_gov_*` views and no table
+> (`DATABASE.md` §5).
+>
+> **The map is district tiles, not a drawn map.** A drawn map needs district
+> boundary data and a mapping library, and a new dependency is the owner's
+> call. The tiles carry the same figures a map would colour, each with its age.
+
+| Section | ID | Wiring |
+|---|---|---|
+| Tabs | `TAB-B13-CAPACITY` / `-ER` / `-SIGNALS` / `-BENCH` | Arrow keys move between them (`A11Y-05`). Each section loads on its own (`GET /gov/capacity`, `/gov/er-load`, `/gov/signals`, `/gov/benchmarks`) and fails on its own with a retry; the screen re-reads every minute |
+| Capacity | — | Nationwide: free beds of total, free ICU of total, burn units open, people in emergency now; then free beds by kind; then one tile per district with the same figures. Ages are the **oldest** ward's in the district, and the nation's the oldest district's (`PRD.md` §3.2). Ventilators and blood stock are named as **not recorded** rather than shown as zero — nothing in this version holds either (`FR-GOV-01`) |
+| ER heat map | — | Districts down, the last twenty-four hours across; a cell is the people an ER recorded arriving (or an "I'm on my way" alert) in that hour, shaded on the brand ramp against the day's busiest cell, with the critical count in its accessible label. Beside each district, the cases open now (`FR-GOV-02`) |
+| Signals | — | Every reporting district × ডেঙ্গু / ডায়রিয়া / জ্বর: this week, the usual week, and a status — হঠাৎ বৃদ্ধি when this week is at least five and at least double the usual week, যথেষ্ট তথ্য নেই when the district has reported for less than a week before this one. A spike is drawn as a bar chart of its three weeks. Counted from `CHIP-B05-SIGNAL` (`FR-GOV-03`) |
+| Benchmarks | — | The last thirty days, one card per measure — check-in-to-call wait, lab turnaround, the four feedback scores — each ranked on its own, best first, with the median. A facility is shown by its **kind** only (বেসরকারি হাসপাতাল, সরকারি হাসপাতাল, ক্লিনিক, ডায়াগনস্টিক সেন্টার), never its name, and a figure resting on fewer than five observations is left out and counted (`FR-GOV-04`) |
+
+**Four states** (`GR-03`): loading is the screen's shape; each section that
+did not arrive says so with a retry; offline keeps the last figures with their
+ages ageing and a banner saying so; an empty section says what would fill it.
+
+---
+
+# PART C — MARKETING WEBSITE
+
+### `S-C-01` Home
+Hero: the live-rescue promise. Two primary CTAs:
+
+| CTA | ID | Destination |
+|---|---|---|
+| রোগীদের জন্য অ্যাপ | `BTN-C01-PATIENT` | App install / `app.[domain]` |
+| হাসপাতালের জন্য | `BTN-C01-HOSPITAL` | `S-C-02` |
+
+### `S-C-02` For hospitals
+Problem framing (waits, no-shows, referral leakage), the consoles with screenshots, and:
+
+| Control | ID | Wiring |
+|---|---|---|
+| ডেমো দেখুন | `BTN-C02-DEMO` | Lead form → super-admin pipeline |
+| কনসোলে লগ ইন | `BTN-C02-LOGIN` | `console.[domain]` → `S-B-00` |
+| PDF ব্রোশিওর | `BTN-C02-PDF` | Download |
+
+### `S-C-03` For doctors · `S-C-04` About · `S-C-05` Contact · `S-C-06` Privacy · `S-C-07` Terms.
+
+There is no pricing page. Commercial terms are discussed with a hospital
+directly, not published — the site's job is to get a decision-maker to
+`BTN-C02-DEMO`.
+
+---
+
+# PART D — CROSS-CUTTING BEHAVIOUR
+
+## D1. State matrix (applies to every screen, `GR-03`)
+
+| State | Public app | Console |
+|---|---|---|
+| Loading | Skeletons matching final layout, never spinners over whole screens | Table skeletons; controls disabled but visible |
+| Empty | Plain Bangla explanation + one action | Same, plus "কী করবেন" hint |
+| Error | Inline banner + পুনরায় চেষ্টা করুন | Toast + retry; work never lost |
+| Offline | Amber staleness banner, cached content, blocked actions explained | Amber rail block, all writes queued, pending count |
+| Stale data | Freshness line turns amber past threshold | Same + de-ranking in emergency search |
+
+## D2. Notification → screen routing
+
+| Event | Push/SMS opens |
+|---|---|
+| Booking confirmed | `S-A-07d` |
+| Doctor arrived / delay declared | `S-A-08` with the delay sheet |
+| Two patients away | `S-A-08` |
+| Called | `S-A-08` takeover |
+| Slot offered | `S-A-08s` offer, with accept/decline and countdown (`FR-PAT-27`); for somebody reception put on the list, the SMS says to ring the counter |
+| Slot seated (prepaid) | `S-A-08s` seated → `S-A-08` (`FR-PAT-26`) |
+| Report ready | `S-A-12` record detail |
+| Follow-up due | `S-A-07b` prefilled with the same doctor |
+| Bed request accepted | `S-A-11` request status |
+| Emergency acknowledged | `S-A-10c` |
+
+## D3. Permission gates
+
+| Action | Requires |
+|---|---|
+| Browse, emergency search, call, navigate, "I'm on my way" | nothing — not even a phone number |
+| Book, pay, bed request, ambulance, blood, diagnostics | guest identity (name + phone + one OTP) **or** logged-in profile (`FR-GST-01`) |
+| Track a guest booking live | the SMS tracking link, or the device that booked (`FR-GST-05`) |
+| Multi-device wallet, saved profiles, full history | account |
+| Any console screen | staff login + role + hospital scope |
+| Record view by staff | patient is in the staff member's session, or QR consent given |
+| National dashboard | R11 only, aggregated data only |
+
+## D4. Keyboard shortcuts (console)
+
+`Space`/`N` next patient · `A` doctor arrived · `D` declare delay · `W` walk-in · `L` mark late · `X` no-show · `F` focus search · `Ctrl+Z` undo last queue action · `Esc` close panel/modal.
+
+## D5. Event → UI propagation summary
+
+| Event | Reception | Doctor | Patient app | Ward/ER | Admin |
+|---|---|---|---|---|---|
+| `EVT-DOCTOR_ARRIVED` | status flips | header updates | status + ETA update, push/SMS | — | punctuality metric |
+| `EVT-PATIENT_CALLED` | row moves | patient panel loads | takeover + push | — | counters |
+| `EVT-DELAY_DECLARED` | banner | header | delay sheet + push/SMS | — | punctuality |
+| `EVT-PATIENT_NO_SHOW` | row marked, waitlist card | — | patient notified | — | loss metric |
+| `EVT-SLOT_ACCEPTED` | new row appears | — | booking confirmed | — | recovery metric |
+| `EVT-BED_OCCUPIED` / `_FREED` | — | — | bed counts update | board tile | occupancy |
+| `EVT-EMERGENCY_INBOUND` | — | — | "on the way" status | ER alert | ER volume |
+| `EVT-REFERRAL_SENT/ACCEPTED` | — | — | — | both ER consoles | referral report |
+
+---
+
+*End of `APP_FLOW.md`. Next documents: `FRONTEND.md` (stack, routing, components, design tokens, offline shell) and `BACKEND.md` (schema, APIs, realtime channels, sync protocol, notification workers, deployment).*

@@ -1,0 +1,304 @@
+/**
+ * Stable error codes (BACKEND.md §9).
+ *
+ * "Stable string codes the client maps to Bangla copy." That is the contract:
+ * the server never sends prose for the user to read, because the user reads
+ * Bangla and the copy lives in `@platform/i18n` (I18N-03: no string literals in
+ * components, and none arriving from an API either).
+ *
+ * Two rules, both enforced below and tested:
+ *
+ *   Every code has exactly one HTTP status. A client that has to inspect a
+ *   message to tell a conflict from a validation failure will get it wrong.
+ *
+ *   An error never returns a raw SQL or provider message to a client
+ *   (BACKEND.md §9). The `message` on the wire is for a developer reading a
+ *   log; anything from Postgres or bKash stays server-side.
+ */
+
+/** Every error the API can return. */
+export const ERROR_CODES = {
+  // --- Auth (FR-SEC-05, FR-ROLE-01) ---------------------------------------
+  AUTH_REQUIRED: { status: 401, message: 'Authentication is required.' },
+  AUTH_OTP_RATE_LIMIT: { status: 429, message: 'Too many OTP requests.' },
+  AUTH_OTP_INVALID: { status: 401, message: 'The code is wrong or has expired.' },
+  AUTH_TOKEN_INVALID: { status: 401, message: 'The token is invalid or has expired.' },
+  AUTH_FORBIDDEN_SCOPE: { status: 403, message: 'Outside this hospital or role scope.' },
+  /**
+   * Staff sign-in (pilot step 21). One answer for an unknown email and a wrong
+   * password, so an address cannot be tested for an account.
+   */
+  AUTH_INVALID_CREDENTIALS: { status: 401, message: 'The email or password is wrong.' },
+  /** Too many consecutive failures; `details.until` says when it opens. */
+  AUTH_LOCKED: { status: 423, message: 'This account is locked for a while.' },
+  /** The email exists at more than one facility on this deployment. */
+  AUTH_HOSPITAL_REQUIRED: { status: 409, message: 'Enter the hospital code as well.' },
+  /** A new password is too short or the same as the old one. */
+  AUTH_PASSWORD_WEAK: { status: 422, message: 'Choose a different password.' },
+  /**
+   * The account's password was set by an administrator. Until the person sets
+   * their own, the token opens nothing but `POST /staff/password`.
+   */
+  AUTH_PASSWORD_CHANGE_REQUIRED: { status: 403, message: 'Set a new password first.' },
+  /**
+   * The second factor (pilot step 28, FR-SEC-10). A code that is wrong, too
+   * old, or already used; it counts towards the same lock as a wrong password.
+   */
+  AUTH_2FA_INVALID: { status: 401, message: 'The code is wrong or has already been used.' },
+  /**
+   * An administrator has no second factor yet. Until one is set up, the token
+   * opens nothing but `POST /staff/2fa/setup` and `/staff/2fa/enable`.
+   */
+  AUTH_2FA_SETUP_REQUIRED: { status: 403, message: 'Set up the second factor first.' },
+  /** Setting up a second factor that is already on; an administrator resets it first. */
+  AUTH_2FA_ALREADY_ON: { status: 409, message: 'The second factor is already on.' },
+
+  // --- Hospital settings (pilot step 22, FR-SUP-01, FR-ADM-11) -------------
+  //
+  // Split the way the queue's are. Something with that code, number, label or
+  // email already exists here: 409, and `details.field` names which. A change
+  // the rules do not allow — an administrator removing their own access, a
+  // verified doctor's identity, going live with nothing to publish — is a
+  // 422 that fails however often it is sent; `details.reason` names the rule.
+  SETTINGS_DUPLICATE: { status: 409, message: 'Something with that value already exists here.' },
+  SETTINGS_NOT_ALLOWED: { status: 422, message: 'That change is not allowed.' },
+
+  // --- Modules (plan C4, FR-BRD-11) ------------------------------------------
+  //
+  // The hospital does not run the module the request belongs to. A 403 that
+  // names the module in `details.module`: the hospital is there, and saying
+  // what it does not do is how a console hides the screen and a patient goes
+  // elsewhere. It fails however often it is sent, until the platform switches
+  // the module on.
+  MODULE_OFF: { status: 403, message: 'This hospital does not run that module.' },
+
+  // --- Imports (pilot step 24, FR-IMP-05..07) -------------------------------
+  //
+  // A file that cannot be read as the set at all — empty, a quote never
+  // closed, the template's columns missing, too many rows — is refused before
+  // any batch exists: 422, `details.reason`. A batch asked to do what its state
+  // does not allow (commit twice, commit with errors, undo a discarded one) is
+  // 409. An undo something has been built on names the rows that stop it.
+  IMPORT_FILE: { status: 422, message: 'That file cannot be read as this set.' },
+  IMPORT_STATE: { status: 409, message: 'That import is not in a state that allows this.' },
+  IMPORT_UNDO_BLOCKED: {
+    status: 409,
+    message: 'Something has been built on rows from this import since.',
+  },
+
+  // --- Guest (FR-GST-05) ---------------------------------------------------
+  GUEST_LINK_EXPIRED: { status: 410, message: 'This tracking link has expired.' },
+
+  // --- Booking -------------------------------------------------------------
+  BOOKING_SLOT_TAKEN: { status: 409, message: 'That serial is no longer available.' },
+  BOOKING_DUPLICATE: {
+    status: 409,
+    message: 'This patient already has a booking with this doctor today.',
+  },
+  /**
+   * Every serial is taken (`FR-PAT-25`).
+   *
+   * A refusal, not a failure: the patient is offered the standby list, so the
+   * response carries the capacity and what is taken rather than a bare "no".
+   */
+  SESSION_FULL: { status: 409, message: 'This chamber is fully booked.' },
+
+  // --- Queue (FR-QUE-51, FR-QUE-53) ---------------------------------------
+  QUEUE_CONFLICT: { status: 409, message: 'Another counter has already advanced this queue.' },
+  QUEUE_GUARD_FAILED: { status: 422, message: 'That queue action is not allowed yet.' },
+
+  // --- Beds (FR-BED-01, FR-BED-02) ----------------------------------------
+  //
+  // Two codes, split the way the queue's are. A transition the bed's current
+  // state does not allow is a 422 — the same request will fail however many
+  // times it is sent. A race lost to another console, or a patient already in
+  // another bed, is a 409. An offline ward console rolls back either one.
+  BED_TRANSITION_INVALID: {
+    status: 422,
+    message: 'That bed cannot do that from its current state.',
+  },
+  BED_CONFLICT: { status: 409, message: 'Another change to this bed or patient got there first.' },
+
+  // --- Emergency (FR-EMG-01..04) -------------------------------------------
+  //
+  // One code, a 422: an action the case's state does not allow, which the
+  // same request will meet however often it is sent — accepting a case the
+  // family has called off, triaging somebody who has not arrived. The races
+  // two ER consoles can run end in the state the other already wrote, and an
+  // action whose outcome is already the case is answered as a replay, not a
+  // conflict (`alreadyApplied` in `shared/domain`).
+  EMERGENCY_TRANSITION_INVALID: {
+    status: 422,
+    message: 'That emergency case cannot do that from its current state.',
+  },
+
+  // --- Referrals (FR-EMG-07..09) --------------------------------------------
+  //
+  // The same shape, for the same reason: a step the referral's state does not
+  // allow — accepting one the sender has withdrawn, referring a case another
+  // ER is already answering. A replay is answered as one, not refused
+  // (`referralAlreadyApplied`).
+  REFERRAL_TRANSITION_INVALID: {
+    status: 422,
+    message: 'That referral cannot do that from its current state.',
+  },
+
+  // --- Lab (FR-LAB-01..03) --------------------------------------------------
+  //
+  // The same shape again, and a 422 for the same reason: the lifecycle only
+  // moves forward, so walking an order back or skipping a state fails however
+  // often it is sent. A replay of a step already taken is answered as one
+  // (`labOrderAlreadyApplied`), never as a refusal.
+  TEST_TRANSITION_INVALID: {
+    status: 422,
+    message: 'That test order cannot do that from its current state.',
+  },
+  /**
+   * The store refused the file, or there is no store configured
+   * (`STORAGE_PROVIDER`). A 503 rather than a 500: the lab's own work is
+   * fine, nothing about the request needs changing, and trying again once
+   * somebody has fixed the environment is the right response.
+   */
+  REPORT_STORAGE_FAILED: {
+    status: 503,
+    message: 'The report could not be stored. Nothing was delivered; try again.',
+  },
+
+  // `FR-PAT-28` (plan R1). A preferred hour that is not one of the chamber's,
+  // or asked of a hospital that does not offer them. Nothing is written.
+  ARRIVAL_WINDOW_NOT_OFFERED: {
+    status: 422,
+    message: 'That arrival hour is not one this chamber offers.',
+  },
+
+  // `FR-PAT-62` (plan R3). The bytes are read, not the name: a file that is
+  // not a JPEG, PNG, WebP or PDF, or is over 8 MB, is refused whatever it says.
+  DOCUMENT_NOT_SUPPORTED: {
+    status: 422,
+    message: 'Only a photograph (JPEG, PNG or WebP) or a PDF, up to 8 MB, can be added.',
+  },
+  /** The same as `REPORT_STORAGE_FAILED`, for a patient's own paper. Nothing was kept. */
+  DOCUMENT_STORAGE_FAILED: {
+    status: 503,
+    message: 'The paper could not be stored. Nothing was kept; try again.',
+  },
+
+  // `FR-PAT-63`. Expired, forged and never-real share one code on purpose: a
+  // caller guessing at consent codes must not learn which guess was closer.
+  CONSENT_CODE_INVALID: { status: 400, message: 'That code has expired or is not valid.' },
+  /**
+   * Not a failure. An offline console re-sending a batch gets the stored
+   * result back, which is what makes replay safe (SY-02) — so it carries a
+   * success status and the original outcome.
+   */
+  QUEUE_EVENT_DUPLICATE: { status: 200, message: 'Already applied.' },
+
+  // --- Payments (FR-PAY-03, FR-PAY-06) -------------------------------------
+  PAYMENT_FAILED: { status: 402, message: 'The payment provider declined the transaction.' },
+  /** `PAYMENT_PROVIDER=off`: this deployment takes payment at the hospital only (pilot step 26). */
+  PAYMENT_UNAVAILABLE: { status: 422, message: 'Only paying at the hospital is available here.' },
+  // Plan H3 (`FR-PAY-08`, `FR-PAY-10`, `FR-PAY-12`).
+  PAYMENT_ALREADY_MADE: { status: 409, message: 'This serial has already been paid for.' },
+  PAYMENT_HOLD_ENDED: {
+    status: 409,
+    message: 'The time to pay for this serial online has run out.',
+  },
+  PREPAYMENT_REQUIRED: {
+    status: 422,
+    message: 'This serial must be paid for online before it is confirmed.',
+  },
+  REFUND_NOTE_REQUIRED: {
+    status: 422,
+    message: 'A refund made by hand needs the reference it was made under.',
+  },
+  /**
+   * The hospital has set no cancellation terms, so there is no rule to
+   * enforce (`FR-PAY-03`). A 409 rather than a 500: nothing is broken, and
+   * the fix is somebody deciding the policy. Returning a silent zero instead
+   * would present a computed number as a decision nobody made (`PRD.md` §3.2).
+   */
+  REFUND_POLICY_UNKNOWN: {
+    status: 409,
+    message: 'This hospital has not set its refund terms, so a refund cannot be calculated.',
+  },
+
+  // --- Consent (FR-PAT-64, FR-DOC-10) -------------------------------------
+  CONSENT_REQUIRED: {
+    status: 403,
+    message: 'The patient has not granted access to these records.',
+  },
+
+  // --- Freshness (FR-OFF-04) ----------------------------------------------
+  /**
+   * Also not a failure. The data is returned and flagged, because a stale
+   * number labelled stale is useful and a missing one is not (PRD.md §3.2).
+   */
+  CAPACITY_STALE: { status: 200, message: 'Returned, but older than the freshness threshold.' },
+
+  // --- Request shape -------------------------------------------------------
+  VALIDATION_FAILED: { status: 400, message: 'The request did not match the expected shape.' },
+  IDEMPOTENCY_KEY_REQUIRED: {
+    status: 400,
+    message: 'This endpoint requires an Idempotency-Key header.',
+  },
+  /**
+   * The key has already made something else (`FR-QUE-51`). A key names one
+   * request: the same request sent again is answered with what it made, and a
+   * different request under the same key is the caller's mistake.
+   */
+  IDEMPOTENCY_KEY_REUSED: {
+    status: 422,
+    message: 'This Idempotency-Key was already used for a different request.',
+  },
+  /**
+   * A person's phone a demonstration does not take (`FR-DEM-08`): under
+   * `DEMO_MODE`, only the demonstration's own numbers. Refused before any
+   * handler, so nothing of the request was written.
+   */
+  DEMO_PHONE_NOT_ALLOWED: {
+    status: 422,
+    message: 'This is a demonstration: only its own demonstration phone numbers can be used.',
+  },
+  /**
+   * Two writes reached for the same thing at the same moment and the database
+   * let one through. Not a fault of the server: the caller reads again and
+   * decides. Used where no route has a more precise word for the race.
+   */
+  WRITE_CONFLICT: {
+    status: 409,
+    message: 'Something else changed this at the same moment. Please try again.',
+  },
+  RATE_LIMITED: { status: 429, message: 'Too many requests.' },
+  /** Too many bookings from one phone number in a day (`FR-GST-14`). */
+  BOOKING_LIMIT_REACHED: {
+    status: 429,
+    message: 'This phone number has made too many bookings today.',
+  },
+  /** A body over its route's limit (256kb, or the report and import routes' own). */
+  PAYLOAD_TOO_LARGE: { status: 413, message: 'The request body is too large.' },
+  NOT_FOUND: { status: 404, message: 'No such resource.' },
+
+  // --- Server --------------------------------------------------------------
+  INTERNAL: { status: 500, message: 'Something went wrong.' },
+  SERVICE_UNAVAILABLE: { status: 503, message: 'The service is not ready.' },
+} as const satisfies Record<string, { status: number; message: string }>;
+
+export type ErrorCode = keyof typeof ERROR_CODES;
+
+/** The HTTP status a code maps to. */
+export function statusFor(code: ErrorCode): number {
+  return ERROR_CODES[code].status;
+}
+
+/** The developer-facing default message for a code. */
+export function messageFor(code: ErrorCode): string {
+  return ERROR_CODES[code].message;
+}
+
+/**
+ * Codes that describe an outcome rather than a failure.
+ *
+ * Both carry a 2xx status, so a client must not treat them as errors — they
+ * exist so the response can be *labelled*.
+ */
+export const NON_FAILURE_CODES = ['QUEUE_EVENT_DUPLICATE', 'CAPACITY_STALE'] as const;

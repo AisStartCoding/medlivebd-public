@@ -1,0 +1,269 @@
+/**
+ * Subscribe, unsubscribe, and resume-from-seq (BACKEND.md §6).
+ *
+ * ## The resume handshake is the interesting part
+ *
+ * "Client sends `lastSeq`; server replays missed events from `queue_events`
+ * before streaming live (`SY-01`)."
+ *
+ * That is what makes a dropped connection a non-event for a patient standing
+ * in a corridor with one bar of signal. Their phone reconnects, says "I had up
+ * to sequence 47", and receives 48 onwards — rather than a fresh snapshot that
+ * may have skipped the moment they were called.
+ *
+ * A client that sends no `lastSeq` gets the current state instead, which is
+ * the right answer for a first subscribe and for a device that has been away
+ * long enough that the delta is bigger than the state.
+ */
+
+import { patientViewOf } from '@platform/domain';
+
+import { runInDbScope, scopeOfPrincipal } from '../config/dbScope.js';
+import { logger } from '../config/logger.js';
+import { ticketsIn } from '../config/serialTicket.js';
+import { AppError } from '../errors/AppError.js';
+import { deskLimit } from '../services/deskAccess.service.js';
+import { firstOff, modulesOff } from '../services/modules.service.js';
+import * as queueService from '../services/queue.service.js';
+
+import { forgetSocket, sessionOf } from './auth.js';
+import { ROOMS, ambientRoomsFor, canJoinSession } from './rooms.js';
+
+import type { Principal } from '../types/express.js';
+import type { Server, Socket } from 'socket.io';
+
+/** What a client sends to join a session's room. */
+interface SubscribeMessage {
+  readonly sessionId?: unknown;
+  /** The highest sequence number this client has already folded (`SY-01`). */
+  readonly lastSeq?: unknown;
+  /** A console's own actions the server has not yet answered (`SY-08`). */
+  readonly unanswered?: unknown;
+}
+
+/** The most keys a subscribe may ask about. A shift's outbox is far below it. */
+const MAX_UNANSWERED = 500;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * How far behind a client may be and still get a delta.
+ *
+ * `SY-06` forces a device offline longer than 24 hours to a full re-pull. The
+ * same logic applies to a socket: past some gap, replaying events costs more
+ * than sending the state, and the state is what the client wants anyway.
+ */
+const MAX_DELTA_EVENTS = 500;
+
+export function registerHandlers(io: Server): void {
+  io.on('connection', (socket) => {
+    const session = sessionOf(socket);
+    if (session === undefined) {
+      // The handshake middleware refuses unauthenticated sockets, so this is
+      // unreachable — and if it ever is reached, the socket is not one to
+      // serve.
+      socket.disconnect(true);
+      return;
+    }
+
+    // Rooms a principal is entitled to without any row lookup: a console's own
+    // hospital boards. Joining costs nothing it is not already allowed to read.
+    void runInDbScope(scopeOfPrincipal(session.principal), async () => {
+      const off =
+        session.principal.kind === 'staff' ? await modulesOff(session.principal.hospitalId) : [];
+      if (sessionOf(socket) !== session || !socket.connected) return;
+      for (const room of ambientRoomsFor(session.principal, off)) {
+        await socket.join(room);
+        session.rooms.add(room);
+      }
+    }).catch(() => socket.disconnect(true));
+
+    socket.on('session:subscribe', (message: SubscribeMessage) => {
+      // A socket's reads are held to its principal's scope like a request's
+      // (`config/dbScope.ts`, `FR-SEC-11`).
+      void runInDbScope(scopeOfPrincipal(session.principal), async () => {
+        await subscribeToSession(socket, message);
+      }).catch((error: unknown) => {
+        emitError(socket, error);
+      });
+    });
+
+    socket.on('session:unsubscribe', (message: SubscribeMessage) => {
+      const sessionId = readSessionId(message);
+      if (sessionId === null) return;
+      for (const room of [ROOMS.session(sessionId), ROOMS.sessionStaff(sessionId)]) {
+        void socket.leave(room);
+        session.rooms.delete(room);
+      }
+    });
+
+    socket.on('disconnect', (reason) => {
+      logger.debug({ socketId: socket.id, reason }, 'socket disconnected');
+      forgetSocket(socket);
+    });
+  });
+}
+
+/**
+ * Joins a session room and catches the client up.
+ *
+ * Authorisation happens here rather than at connection time because it depends
+ * on rows: whether this principal holds a booking in this session, and which
+ * hospital is running it.
+ */
+async function subscribeToSession(socket: Socket, message: SubscribeMessage): Promise<void> {
+  const session = sessionOf(socket);
+  if (session === undefined) {
+    socket.disconnect(true);
+    return;
+  }
+
+  const sessionId = readSessionId(message);
+  if (sessionId === null) {
+    emitError(socket, new AppError('VALIDATION_FAILED', { details: { field: 'sessionId' } }));
+    return;
+  }
+
+  const record = await queueService.requireSession(sessionId);
+  const allowed = canJoinSession(session.principal, {
+    hospitalId: record.hospitalId,
+    holdsBooking: await holdsBooking(session.principal, sessionId),
+  });
+
+  // `FR-REC-32` (question 20): the same desk rule as every route.
+  const deskLimited = await deskLimit(session.principal);
+  if (!allowed || (deskLimited !== null && !deskLimited.has(record.doctorId))) {
+    emitError(socket, new AppError('AUTH_FORBIDDEN_SCOPE', { details: { room: 'session' } }));
+    return;
+  }
+  if (
+    session.principal.kind === 'staff' &&
+    (await firstOff(record.hospitalId, ['queue'])) !== null
+  ) {
+    emitError(socket, new AppError('MODULE_OFF', { details: { module: 'queue' } }));
+    return;
+  }
+
+  // Staff hear the queue as reception holds it; anybody else the patients'
+  // copy, which names nobody (plan I2c, `queue/patientView`).
+  const staff = session.principal.kind === 'staff';
+  const room = staff ? ROOMS.sessionStaff(sessionId) : ROOMS.session(sessionId);
+  if (sessionOf(socket) !== session || !socket.connected) return;
+  await socket.join(room);
+  session.rooms.add(room);
+
+  const lastSeq = readLastSeq(message);
+  const state = await queueService.getState(sessionId);
+  const etas = await queueService.getEtas(sessionId);
+  const serverTs = new Date().toISOString();
+
+  // A phone is caught up with the patients' copy as it stands, never with the
+  // log's events: an event names the booking it is about.
+  if (!staff) {
+    socket.emit('queue.updated', {
+      type: 'queue.updated',
+      seq: state.lastSeq,
+      serverTs,
+      applied: [],
+      data: patientViewOf(state, etas, ticketsIn(sessionId)),
+    });
+    return;
+  }
+
+  // `SY-08`: a console that subscribes with actions it has not been answered
+  // for says which. Those the log already holds are named beside the state
+  // that contains them, so an answer lost on the way is settled here. Staff
+  // only: nobody else has actions. Read after the state and bounded by its
+  // sequence, so nothing is named that this state does not yet show.
+  const unanswered = readUnanswered(message);
+  const applied = await queueService.appliedAmong(sessionId, unanswered, state.lastSeq);
+
+  // Far enough behind, or never subscribed: send the state rather than a
+  // delta. A client that has to fold five hundred events to learn it is
+  // number eighteen is a client on a cheap phone locking up (`SY-06`).
+  if (lastSeq === null || state.lastSeq - lastSeq > MAX_DELTA_EVENTS) {
+    socket.emit('queue.updated', {
+      type: 'queue.updated',
+      seq: state.lastSeq,
+      serverTs,
+      applied,
+      data: { state, etas },
+    });
+    return;
+  }
+
+  // Replay what they missed, in order, before any live event reaches them.
+  const missed = await queueService.eventsSince(sessionId, lastSeq);
+  for (const event of missed) {
+    socket.emit('queue.event', {
+      type: event.type,
+      seq: event.seq,
+      serverTs: event.serverTs,
+      data: event,
+    });
+  }
+
+  // Then the settled state, so a client that failed to fold something still
+  // converges (`FR-QUE-05`).
+  socket.emit('queue.updated', {
+    type: 'queue.updated',
+    seq: state.lastSeq,
+    serverTs,
+    applied,
+    data: { state, etas },
+  });
+}
+
+/** The keys a console asks about: well-formed, distinct, and not too many. */
+function readUnanswered(message: SubscribeMessage): string[] {
+  const value = message.unanswered;
+  if (!Array.isArray(value)) return [];
+
+  const keys = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry === 'string' && UUID.test(entry)) keys.add(entry.toLowerCase());
+    if (keys.size >= MAX_UNANSWERED) break;
+  }
+  return [...keys];
+}
+
+/** Whether this principal holds a booking in the session. */
+async function holdsBooking(principal: Principal, sessionId: string): Promise<boolean> {
+  if (principal.kind === 'staff') return false;
+
+  // A tracking link names exactly one booking (`FR-GST-05`); an account holder
+  // may have any of theirs in this session.
+  return await queueService.principalHoldsBooking(sessionId, {
+    userId: principal.kind === 'patient' ? principal.id : null,
+    bookingId: principal.kind === 'guest' ? principal.bookingId : null,
+  });
+}
+
+function readSessionId(message: SubscribeMessage): string | null {
+  const value = message.sessionId;
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function readLastSeq(message: SubscribeMessage): number | null {
+  const value = message.lastSeq;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Sends a failure to one socket.
+ *
+ * The same stable code the HTTP layer uses, so a client maps it to the same
+ * Bangla copy (BACKEND.md §9) rather than having a second vocabulary for
+ * realtime failures.
+ */
+function emitError(socket: Socket, thrown: unknown): void {
+  const error = thrown instanceof AppError ? thrown : new AppError('INTERNAL', { cause: thrown });
+  if (!(thrown instanceof AppError)) {
+    logger.error({ err: thrown, socketId: socket.id }, 'socket handler failed');
+  }
+  socket.emit('error.occurred', {
+    type: 'error.occurred',
+    serverTs: new Date().toISOString(),
+    data: error.toBody().error,
+  });
+}

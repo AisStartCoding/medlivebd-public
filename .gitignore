@@ -1,0 +1,74 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+# Render's build installs pnpm here (render.yaml).
+.render/
+
+# Environment — never commit real secrets (FR-SEC-08)
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Written by Next, and rewritten with a different path by each command that
+# writes it: `next dev` points it at `.next/dev/types`, `next build` at
+# `.next/types`. Tracked, it was a modification in `git status` after every
+# single dev run or build, belonging to nobody. `tsconfig.json` still includes
+# it, and both apps typecheck on a clean clone without it.
+next-env.d.ts
+
+# Test and coverage output
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# Local-only files
+.local/
+*.local
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Caches
+.turbo/
+.eslintcache
+.cache/
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+
+# A self-hosted server's backups and local files (pilot step 26): patient data,
+# never committed (FR-SEC-08).
+deploy/backups/
+deploy/backups-second/
+storage/
+
+# A database dump taken before a release (DEPLOY.md 7.3). It can hold a
+# deployment's data and never belongs in the repository.
+*.dump
+
+# Python (the Django backend, backend/django)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

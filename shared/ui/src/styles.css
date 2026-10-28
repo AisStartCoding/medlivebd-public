@@ -1,0 +1,216 @@
+/*
+ * The stylesheet every app imports (FRONTEND.md §9, §10).
+ *
+ * Three layers, in order:
+ *
+ *   1. Tailwind itself.
+ *   2. `tokens.css` — the raw custom properties, which are the design system.
+ *   3. `@theme inline` — the mapping that makes Tailwind's utilities resolve
+ *      to those properties and to nothing else.
+ *
+ * `inline` is the important word. It tells Tailwind to emit the utility
+ * referencing `var(--brand-600)` rather than copying the value, so there
+ * remains exactly one place a colour is defined (FRONTEND.md §10: "if a colour
+ * or radius appears in an app package, it is a bug"). Change `tokens.css` and
+ * every utility follows; nothing needs regenerating.
+ *
+ * ## The defaults are cleared, not extended
+ *
+ * `--color-*: initial` removes Tailwind's own palette. Leaving it in place
+ * would leave `bg-indigo-500` one keystroke away, and an indigo primary is the
+ * first item on the banned list (§0.2) because it is the default accent of
+ * every generated app. `--tracking-*: initial` does the same for letter
+ * spacing, which must never be applied to Bangla (`TYP-02`).
+ *
+ * One rule cannot be enforced here: `uppercase` and `capitalize` are not
+ * theme-driven in Tailwind v4, so they cannot be removed at configuration
+ * level the way the v3 `corePlugins` switch did. Bangla has no case, so they
+ * are meaningless on it; that one stays a review check (FRONTEND.md §13).
+ */
+
+@import 'tailwindcss';
+@import './tokens/tokens.css';
+
+/*
+ * Scan this package's own components.
+ *
+ * Tailwind v4 detects sources from the directory of the stylesheet that
+ * imported it, and skips anything under `node_modules`. An app resolves this
+ * file through the workspace symlink `node_modules/@platform/ui`, so detection
+ * fell back to the app's own `src` — and every class used *only* inside a
+ * design-system component was silently dropped from the build.
+ *
+ * The symptom was not a missing stylesheet but a half-applied one: `bg-surface`
+ * worked because a screen happened to use it too, while `inset-x-0 bottom-0` on
+ * the bottom sheet did not, so the sheet rendered shrink-wrapped at its static
+ * position instead of across the foot of the screen. A component library whose
+ * classes depend on an application coincidentally using the same ones is not a
+ * component library, so this line is load-bearing.
+ */
+@source "./**/*.{js,jsx}";
+
+@theme inline {
+  /* --- Colour (§1.1) ---------------------------------------------------- */
+  --color-*: initial;
+
+  --color-transparent: transparent;
+  --color-current: currentColor;
+  --color-white: #ffffff;
+
+  --color-canvas: var(--bg-canvas);
+  --color-surface: var(--bg-surface);
+  --color-sunken: var(--bg-sunken);
+  --color-inverse: var(--bg-inverse);
+
+  --color-ink: var(--ink-primary);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-inverse: var(--ink-inverse);
+
+  --color-brand-900: var(--brand-900);
+  --color-brand-700: var(--brand-700);
+  --color-brand-600: var(--brand-600);
+  --color-brand-300: var(--brand-300);
+  --color-brand-100: var(--brand-100);
+  --color-brand-border: var(--brand-border);
+
+  /* Reserved for emergency and genuine danger (§1.1 colour law). */
+  --color-alert-700: var(--alert-700);
+  --color-alert-600: var(--alert-600);
+  --color-alert-100: var(--alert-100);
+
+  /* Exactly three meanings: delay, staleness, late patient. */
+  --color-warn-700: var(--warn-700);
+  --color-warn-600: var(--warn-600);
+  --color-warn-100: var(--warn-100);
+  --color-warn-border: var(--warn-border);
+
+  /* Good news only (§5.5); and the accent, never text (§0.5). */
+  --color-positive-700: var(--positive-700);
+  --color-positive-600: var(--positive-600);
+  --color-positive-100: var(--positive-100);
+  --color-accent-500: var(--accent-500);
+  --color-accent-100: var(--accent-100);
+
+  --color-line-strong: var(--line-strong);
+  --color-line: var(--line-soft);
+  --color-line-hairline: var(--line-hairline);
+
+  /* --- Radii (§3.2) — scales with the element, never uniform ------------ *
+   * Declared here rather than in `tokens.css` because `--radius-*` is
+   * Tailwind's own namespace: these ARE the tokens, not a mapping onto them. */
+  --radius-*: initial;
+  --radius-xs: 8px; /* chips, badges, inline tags */
+  --radius-sm: 12px; /* inputs, small buttons, row actions */
+  --radius-md: 16px; /* cards, tiles, primary buttons */
+  --radius-lg: 22px; /* hero cards, bottom sheets */
+  --radius-pill: 999px; /* filter chips and avatars only */
+
+  /* --- Elevation (§3.3) — neutral-tinted, never coloured ---------------- */
+  --shadow-*: initial;
+  --shadow-1: var(--elev-1);
+  --shadow-2: var(--elev-2);
+  --shadow-3: var(--elev-3);
+
+  /* --- Type (§2.1, §2.3) ------------------------------------------------ *
+   * One superfamily across both scripts. Hind Siliguri is the fallback: the
+   * most commonly installed quality Bangla face in the region. The system
+   * stack is last and is never the design.                                   */
+  --font-ui:
+    var(--font-anek, 'Anek Bangla'), 'Hind Siliguri', 'Noto Sans Bengali', system-ui, sans-serif;
+  --font-reading: var(--font-tiro, 'Tiro Bangla'), 'Noto Serif Bengali', Georgia, serif;
+
+  --text-display-xl: 56px;
+  --text-display-xl--line-height: 1.15;
+  --text-display-lg: 40px;
+  --text-display-lg--line-height: 1.2;
+  --text-title-lg: 24px;
+  --text-title-lg--line-height: 1.35;
+  --text-title-md: 20px;
+  --text-title-md--line-height: 1.4;
+  --text-title-sm: 17px;
+  --text-title-sm--line-height: 1.45;
+  --text-body-lg: 16px;
+  --text-body-lg--line-height: 1.65;
+  --text-body-md: 15px;
+  --text-body-md--line-height: 1.65;
+  --text-body-sm: 13px;
+  --text-body-sm--line-height: 1.6;
+  --text-caption: 12px;
+  --text-caption--line-height: 1.55;
+
+  /* TYP-02: never applied to Bangla, so the utilities do not exist. */
+  --tracking-*: initial;
+
+  /* --- Motion (§3.4) — explains a state change, never entertains -------- *
+   * `--duration-*` and `--ease-*` are Tailwind's own namespaces, so these ARE
+   * the utilities `duration-quick` and `ease-sheet` resolve to. They read the
+   * same custom properties `tokens.css` defines, which is what makes
+   * `prefers-reduced-motion` zero every one of them at once.              */
+  --duration-instant: var(--motion-instant);
+  --duration-quick: var(--motion-quick);
+  --duration-sheet: var(--motion-sheet);
+  --duration-count: var(--motion-count);
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-sheet: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-count: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/*
+ * The minimum touch target (`FR-LOC-04`, `A11Y-07`, FRONTEND.md §5.1).
+ *
+ * Forty-four pixels, and it needs a definition: `min-h-touch` is not a
+ * Tailwind utility, so every `min-h-touch` in the codebase was being dropped —
+ * ten of them, across the buttons, chips and inputs a person taps on a phone.
+ * Declared here rather than as an arbitrary value at each call site so the
+ * floor is one number, and the same one `MIN_TOUCH_TARGET_PX` exports.
+ */
+@utility min-h-touch {
+  min-height: 44px;
+}
+
+/*
+ * The app ground. Set here rather than in each app so the three of them cannot
+ * drift, and warm rather than white because that is most of why the palette
+ * reads as an institution (§0.3).
+ */
+@layer base {
+  html {
+    background: var(--bg-canvas);
+    color: var(--ink-primary);
+    font-family: var(--font-ui);
+  }
+
+  /* A11Y-02: a visible focus ring on everything interactive, always. */
+  :focus-visible {
+    outline: 2px solid var(--brand-600);
+    outline-offset: 2px;
+  }
+}
+
+/*
+ * The printed prescription (FR-DOC-07, plan R2; `PrescriptionSheet`).
+ *
+ * Never on screen. While a sheet is being printed the document is marked
+ * `data-printing`, and the print is the sheet and nothing else: no rail, no
+ * header, no buttons on a piece of paper a patient keeps.
+ */
+[data-print-sheet] {
+  display: none;
+}
+
+@media print {
+  html[data-printing] body > :not([data-print-sheet]) {
+    display: none !important;
+  }
+
+  html[data-printing],
+  html[data-printing] body {
+    background: var(--bg-surface);
+  }
+
+  html[data-printing] [data-print-sheet] {
+    display: flex;
+  }
+}

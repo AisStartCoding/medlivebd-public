@@ -1,0 +1,326 @@
+/**
+ * Environment validation (BACKEND.md §10).
+ *
+ * "env.ts validates all of these with zod at boot and refuses to start if any
+ * required key is missing." The tests worth writing are the ones about what
+ * must *not* boot, because every one of them describes a way this service
+ * could come up looking healthy and be dangerous.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import { EnvError, loadEnv } from '../env.js';
+
+/** A minimal valid development environment. */
+const DEV: Readonly<Record<string, string>> = {
+  NODE_ENV: 'development',
+  API_BASE_URL: 'http://localhost:4000',
+  WEB_BASE_URL: 'http://localhost:3000',
+  DATABASE_URL: 'postgresql://healthcare:healthcare@localhost:5432/healthcare_dev',
+  JWT_ACCESS_SECRET: 'a'.repeat(32),
+  JWT_REFRESH_SECRET: 'b'.repeat(32),
+  GUEST_LINK_SECRET: 'c'.repeat(32),
+};
+
+/** A valid production environment. */
+const PROD: Readonly<Record<string, string>> = {
+  ...DEV,
+  NODE_ENV: 'production',
+  API_BASE_URL: 'https://api.example.com',
+  WEB_BASE_URL: 'https://app.example.com',
+  SUPABASE_URL: 'https://project.supabase.co',
+  SUPABASE_SERVICE_ROLE_KEY: 'service-role-key',
+  SMS_PROVIDER: 'local',
+  SMS_API_KEY: 'sms-key',
+  SMS_SENDER_ID: 'HEALTH',
+  VAPID_PUBLIC_KEY: 'vapid-public',
+  VAPID_PRIVATE_KEY: 'vapid-private',
+  PAYMENT_PROVIDER: 'live',
+  STORAGE_PROVIDER: 'local',
+  SENTRY_DSN: 'https://sentry.example.com/1',
+  TOTP_ENCRYPTION_KEY: 'd'.repeat(32),
+  DEMO_MODE: 'false',
+};
+
+function problemsOf(source: Record<string, string>): readonly string[] {
+  try {
+    loadEnv(source);
+  } catch (error) {
+    if (error instanceof EnvError) return error.problems.map((problem) => problem.key);
+    throw error;
+  }
+  return [];
+}
+
+describe('development', () => {
+  it('needs no key for staff second factors: one is derived (pilot step 28)', () => {
+    expect(loadEnv({ ...DEV }).TOTP_ENCRYPTION_KEY).toBe('');
+  });
+
+  it('accepts a minimal environment', () => {
+    const env = loadEnv({ ...DEV });
+
+    expect(env.NODE_ENV).toBe('development');
+    expect(env.PORT).toBe(4000);
+    expect(env.SMS_PROVIDER).toBe('log');
+    expect(env.PAYMENT_PROVIDER).toBe('mock');
+  });
+
+  it('applies every default from the document', () => {
+    const env = loadEnv({ ...DEV });
+
+    expect(env.JWT_ACCESS_TTL).toBe('15m');
+    expect(env.JWT_REFRESH_TTL).toBe('30d');
+    expect(env.GUEST_LINK_TTL_DAYS).toBe(30);
+    expect(env.OTP_TTL_SECONDS).toBe(300);
+    expect(env.OTP_MAX_PER_HOUR).toBe(5);
+    expect(env.STALE_THRESHOLD_MINUTES).toBe(10);
+    expect(env.DATABASE_POOL_MAX).toBe(10);
+  });
+
+  it('leaves the cloud credentials blank, because the local stack needs none', () => {
+    const env = loadEnv({ ...DEV });
+
+    expect(env.SUPABASE_SERVICE_ROLE_KEY).toBe('');
+    expect(env.SENTRY_DSN).toBe('');
+  });
+
+  it('coerces numbers and booleans from strings', () => {
+    const env = loadEnv({ ...DEV, PORT: '8080', DEMO_MODE: 'true' });
+
+    expect(env.PORT).toBe(8080);
+    expect(env.DEMO_MODE).toBe(true);
+  });
+});
+
+describe('refusing to start', () => {
+  it('lists every problem at once rather than the first', () => {
+    const problems = problemsOf({ NODE_ENV: 'development' });
+
+    expect(problems).toContain('DATABASE_URL');
+    expect(problems).toContain('JWT_ACCESS_SECRET');
+    expect(problems.length).toBeGreaterThan(3);
+  });
+
+  it('refuses a short secret, with the command to generate one', () => {
+    try {
+      loadEnv({ ...DEV, JWT_ACCESS_SECRET: 'short' });
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(EnvError);
+      expect((error as EnvError).message).toContain('randomBytes(32)');
+    }
+  });
+
+  it('refuses a malformed URL', () => {
+    expect(problemsOf({ ...DEV, API_BASE_URL: 'localhost:4000' })).toContain('API_BASE_URL');
+  });
+
+  it('refuses a port outside the valid range', () => {
+    expect(problemsOf({ ...DEV, PORT: '70000' })).toContain('PORT');
+  });
+
+  it('refuses a TTL that is not a duration', () => {
+    expect(problemsOf({ ...DEV, JWT_ACCESS_TTL: '15 minutes' })).toContain('JWT_ACCESS_TTL');
+  });
+
+  it('refuses an unknown provider', () => {
+    expect(problemsOf({ ...DEV, SMS_PROVIDER: 'twilio' })).toContain('SMS_PROVIDER');
+  });
+});
+
+describe('production', () => {
+  it('accepts a complete environment', () => {
+    const env = loadEnv({ ...PROD });
+
+    expect(env.NODE_ENV).toBe('production');
+    expect(env.DEMO_MODE).toBe(false);
+  });
+
+  it('refuses demo mode, which permits database reset and mock payments', () => {
+    // FR-SEC-08: demo and prototype environments contain no real patient data,
+    // and the converse matters just as much — a production environment must
+    // not accept demo behaviour.
+    const problems = problemsOf({ ...PROD, DEMO_MODE: 'true' });
+
+    expect(problems).toContain('DEMO_MODE');
+  });
+
+  it('refuses the mock payment adapter, which approves every payment', () => {
+    expect(problemsOf({ ...PROD, PAYMENT_PROVIDER: 'mock' })).toContain('PAYMENT_PROVIDER');
+  });
+
+  it('refuses the mock file store, which loses every report on restart', () => {
+    // `FR-LAB-03`: a report that reached a patient's wallet has to still be
+    // there tomorrow. The mock keeps bytes in process memory.
+    expect(problemsOf({ ...PROD, STORAGE_PROVIDER: 'mock' })).toContain('STORAGE_PROVIDER');
+  });
+
+  it('refuses a shared access and refresh secret', () => {
+    // Sharing them lets a 15-minute access token be replayed as a 30-day
+    // refresh token.
+    const problems = problemsOf({
+      ...PROD,
+      JWT_ACCESS_SECRET: 'z'.repeat(32),
+      JWT_REFRESH_SECRET: 'z'.repeat(32),
+    });
+
+    expect(problems).toContain('JWT_REFRESH_SECRET');
+  });
+
+  it('refuses a tracking-link key that is also a token key (plan I2b)', () => {
+    expect(problemsOf({ ...PROD, GUEST_LINK_SECRET: PROD['JWT_ACCESS_SECRET'] ?? '' })).toContain(
+      'GUEST_LINK_SECRET',
+    );
+    expect(problemsOf({ ...PROD, GUEST_LINK_SECRET: PROD['JWT_REFRESH_SECRET'] ?? '' })).toContain(
+      'GUEST_LINK_SECRET',
+    );
+  });
+
+  it('refuses a second-factor key that is any other secret (FR-SEC-10, plan I2b)', () => {
+    for (const other of ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET', 'GUEST_LINK_SECRET']) {
+      expect(problemsOf({ ...PROD, TOTP_ENCRYPTION_KEY: PROD[other] ?? '' }), other).toContain(
+        'TOTP_ENCRYPTION_KEY',
+      );
+    }
+    // Four different keys, as the complete environment above has, boot.
+    expect(problemsOf({ ...PROD })).toEqual([]);
+  });
+
+  it('refuses missing storage credentials, and says what breaks', () => {
+    try {
+      loadEnv({ ...PROD, STORAGE_PROVIDER: 'supabase', SUPABASE_SERVICE_ROLE_KEY: '' });
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect((error as EnvError).message).toContain('no patient could open a report');
+    }
+  });
+
+  it('refuses Supabase Storage, which has no adapter in this version (audit F-04)', () => {
+    // Accepted by the schema, its keys asked for, and then every upload
+    // refused by `UnconfiguredStorageAdapter`. A server must not boot that way.
+    expect(problemsOf({ ...PROD, STORAGE_PROVIDER: 'supabase' })).toContain('STORAGE_PROVIDER');
+  });
+
+  it('refuses missing SMS credentials when a real provider is configured', () => {
+    const problems = problemsOf({ ...PROD, SMS_API_KEY: '' });
+
+    // Without SMS there is no tracking link, and a guest has no way to follow
+    // their serial (FR-GST-05).
+    expect(problems).toContain('SMS_API_KEY');
+  });
+
+  it('does not ask for SMS credentials when the log provider is deliberate', () => {
+    const problems = problemsOf({
+      ...PROD,
+      SMS_PROVIDER: 'log',
+      SMS_API_KEY: '',
+      SMS_SENDER_ID: '',
+    });
+
+    expect(problems).not.toContain('SMS_API_KEY');
+    expect(problems).not.toContain('SMS_SENDER_ID');
+  });
+
+  it('does not demand push keys while nothing sends Web Push (pilot step 26)', () => {
+    // FR-NOT-02's push half waits for an adapter; SMS carries the messages.
+    expect(problemsOf({ ...PROD, VAPID_PUBLIC_KEY: '', VAPID_PRIVATE_KEY: '' })).toEqual([]);
+  });
+
+  it('does not demand a Sentry DSN nothing reports to yet (pilot step 26)', () => {
+    expect(problemsOf({ ...PROD, SENTRY_DSN: '' })).not.toContain('SENTRY_DSN');
+  });
+
+  it('boots a hospital’s own server: local files, no online payment, no Supabase (FR-SEC-07)', () => {
+    expect(
+      problemsOf({
+        ...PROD,
+        STORAGE_PROVIDER: 'local',
+        STORAGE_DIR: '/var/lib/medlivebd/files',
+        PAYMENT_PROVIDER: 'off',
+        SUPABASE_URL: '',
+        SUPABASE_SERVICE_ROLE_KEY: '',
+      }),
+    ).toEqual([]);
+  });
+
+  it('asks for its own key for staff second factors (pilot step 28, FR-SEC-10)', () => {
+    // A key derived from JWT_REFRESH_SECRET would lock every administrator out
+    // the day that secret is rotated.
+    expect(problemsOf({ ...PROD, TOTP_ENCRYPTION_KEY: '' })).toContain('TOTP_ENCRYPTION_KEY');
+    expect(problemsOf({ ...PROD, TOTP_ENCRYPTION_KEY: 'short' })).toContain('TOTP_ENCRYPTION_KEY');
+  });
+
+  it('still refuses the mock payment and storage adapters in production', () => {
+    const problems = problemsOf({ ...PROD, PAYMENT_PROVIDER: 'mock', STORAGE_PROVIDER: 'mock' });
+    expect(problems).toContain('PAYMENT_PROVIDER');
+    expect(problems).toContain('STORAGE_PROVIDER');
+  });
+});
+
+/**
+ * Every value the shipped configuration actually tells somebody to write.
+ *
+ * `.env.example` and `render.yaml` are the two files a person copies from, so
+ * a value either of them contains has to parse. `PLATFORM_FEE_POISHA=0` did
+ * not, and nothing caught it because the schema's default masked the failure:
+ * the variable only parsed while it was absent, and both templates say to set
+ * it.
+ */
+describe("a demonstration's phone list (FR-DEM-08)", () => {
+  it('is the built-in list when unset, and a deployment’s own when given', () => {
+    expect(loadEnv({ ...DEV, DEMO_MODE: 'true' }).DEMO_PHONES).toBeUndefined();
+    expect(
+      loadEnv({ ...DEV, DEMO_MODE: 'true', DEMO_PHONES: '01380000001, +880 1380-000002' })
+        .DEMO_PHONES,
+    ).toEqual(['+8801380000001', '+8801380000002']);
+  });
+
+  it('refuses an entry that is not a Bangladeshi mobile', () => {
+    expect(problemsOf({ ...DEV, DEMO_MODE: 'true', DEMO_PHONES: '01380000001,12345' })).toContain(
+      'DEMO_PHONES',
+    );
+  });
+
+  it('takes "any" only with a database on this machine', () => {
+    expect(loadEnv({ ...DEV, DEMO_MODE: 'true', DEMO_PHONES: 'any' }).DEMO_PHONES).toBe('any');
+    expect(
+      problemsOf({
+        ...DEV,
+        DEMO_MODE: 'true',
+        DEMO_PHONES: 'any',
+        DATABASE_URL: 'postgresql://postgres:x@aws-0-ap-southeast-1.pooler.supabase.com:5432/db',
+      }),
+    ).toContain('DEMO_PHONES');
+  });
+});
+
+describe('the shipped configuration parses', () => {
+  it('accepts a platform fee of zero, which is what both templates say', () => {
+    // An environment variable is a string. `positive().or(literal(0))` looked
+    // equivalent to `nonnegative()` and was not: "0" coerced to 0 failed
+    // `.positive()`, and `z.literal(0)` was then handed the string and failed
+    // too, because a literal does not coerce.
+    expect(loadEnv({ ...DEV, PLATFORM_FEE_POISHA: '0' }).PLATFORM_FEE_POISHA).toBe(0);
+  });
+
+  it('accepts a real fee', () => {
+    expect(loadEnv({ ...DEV, PLATFORM_FEE_POISHA: '2500' }).PLATFORM_FEE_POISHA).toBe(2500);
+  });
+
+  it('still refuses a negative fee', () => {
+    // Money is integer poisha (`DB-P5`), and a negative platform fee would pay
+    // the hospital out of the platform's pocket on every booking.
+    expect(() => loadEnv({ ...DEV, PLATFORM_FEE_POISHA: '-1' })).toThrow(EnvError);
+  });
+
+  it('boots without the base URLs a deployment fills in later', () => {
+    // `API_BASE_URL` has no consumer, and `WEB_BASE_URL` has a sensible local
+    // default. Requiring either meant a first deploy failed at boot on a
+    // variable nobody had a value for yet.
+    const { API_BASE_URL, ...withoutApiUrl } = DEV;
+    void API_BASE_URL;
+
+    expect(() => loadEnv(withoutApiUrl)).not.toThrow();
+  });
+});

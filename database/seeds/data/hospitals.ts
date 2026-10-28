@@ -1,0 +1,278 @@
+/**
+ * The six declared demo facilities (`FR-DEM-01`).
+ *
+ * **This file is the declared demo set.** CLAUDE.md §8 forbids inventing a
+ * hospital name outside it, so a facility that is not here does not exist in
+ * this product's demo — adding one is an edit to this file, reviewed like any
+ * other.
+ *
+ * Every name is fictional and carries the `FR-DEM-07` label. The names are
+ * rivers and a water lily, which is why none of them reads as a real
+ * institution: `শাপলা` (shapla, the national flower), `পদ্মা`, `কর্ণফুলী`,
+ * `যমুনা`, `মেঘনা`, `বুড়িগঙ্গা`.
+ *
+ * Coordinates are real neighbourhood centroids rather than invented points.
+ * That matters: the emergency search ranks by travel time (`FR-PAT-43`), and a
+ * fabricated coordinate produces a confident wrong answer, which
+ * `hospitals_lat_in_bangladesh` exists to prevent and `PRD.md` §3.2 forbids.
+ * A coordinate is public geography, not clinical content.
+ */
+
+import type { Division, SpecialtyCode } from './reference.js';
+
+export type FacilityKind = 'hospital' | 'clinic' | 'diagnostic' | 'government';
+
+/** Capability kinds, mirroring `capability_kind` (DATABASE.md §1). */
+export type CapabilityKind =
+  | 'burn_unit'
+  | 'cardiac'
+  | 'cath_lab'
+  | 'stroke'
+  | 'dialysis'
+  | 'nicu'
+  | 'trauma_ot'
+  | 'blood_bank'
+  | 'ambulance'
+  | 'isolation';
+
+export interface DemoFacility {
+  /** Stable key used by the other seeds and by the tests. Never displayed. */
+  readonly slug: string;
+  /** Without the demo label; the label is appended when the row is written. */
+  readonly nameBn: string;
+  readonly nameEn: string;
+  readonly kind: FacilityKind;
+  readonly division: Division;
+  readonly district: string;
+  readonly thana: string;
+  readonly addressBn: string;
+  readonly addressEn: string;
+  /**
+   * What the facility says of itself to patients (`FR-BRD-06`). Says it is
+   * demonstration data in so many words, because it is shown on its own with
+   * no name beside it to carry the label (`FR-DEM-07`).
+   */
+  readonly descriptionBn: string;
+  readonly descriptionEn: string;
+  readonly lat: number;
+  readonly lng: number;
+  /** Landline form; `hospitals_phone_normalised` allows `+880` + 8–11 digits. */
+  readonly phone: string;
+  readonly emergencyPhone: string | null;
+  /** Departments this facility runs, by specialty code. */
+  readonly departments: readonly SpecialtyCode[];
+  /** Published to the emergency network (`FR-EMG-05`). */
+  readonly capabilities: readonly CapabilityKind[];
+  /**
+   * Whether this facility has an ICU. `FR-DEM-04` asks for exactly three, and
+   * `data/beds.ts` declares an ICU ward for each of them and for no other —
+   * `seeds.test.ts` holds the two descriptions to each other.
+   */
+  readonly hasIcu: boolean;
+  /** Roughly how large, which is what sets bed counts and session capacity. */
+  readonly size: 'large' | 'mid' | 'small';
+  /** Console default; `hospital_settings.numeral_style` (TYP-04). */
+  readonly numeralStyle: 'latin' | 'bengali';
+}
+
+/**
+ * Two large private in Dhaka, one mid-size private in Chattogram, one
+ * government medical college, one diagnostic centre, one clinic — exactly the
+ * mix `FR-DEM-01` names, in that order.
+ */
+export const DEMO_FACILITIES: readonly DemoFacility[] = [
+  {
+    slug: 'shapla-general',
+    nameBn: 'শাপলা জেনারেল হাসপাতাল',
+    nameEn: 'Shapla General Hospital',
+    kind: 'hospital',
+    division: 'Dhaka',
+    district: 'Dhaka',
+    thana: 'Dhanmondi',
+    addressBn: 'সড়ক ৭, ধানমন্ডি, ঢাকা ১২০৫',
+    addressEn: 'Road 7, Dhanmondi, Dhaka 1205',
+    descriptionBn:
+      'ধানমন্ডির একটি বড় বেসরকারি হাসপাতাল। হৃদরোগ, মেডিসিন, শিশু, স্নায়ু ও আরও বিভাগ, সঙ্গে জরুরি বিভাগ। এটি প্রদর্শনীর জন্য বানানো তথ্য।',
+    descriptionEn:
+      'A large private hospital in Dhanmondi: cardiology, medicine, paediatrics, neurology and more, with an emergency department. This is demonstration data.',
+    lat: 23.7461,
+    lng: 90.376,
+    phone: '+880255010001',
+    emergencyPhone: '+880255010999',
+    departments: ['CARD', 'MED', 'GYN', 'ORTHO', 'PAED', 'NEURO', 'ENT', 'DERM'],
+    capabilities: [
+      'cardiac',
+      'cath_lab',
+      'stroke',
+      'dialysis',
+      'nicu',
+      'trauma_ot',
+      'blood_bank',
+      'ambulance',
+      'isolation',
+    ],
+    hasIcu: true,
+    size: 'large',
+    numeralStyle: 'latin',
+  },
+  {
+    slug: 'padma-specialised',
+    nameBn: 'পদ্মা স্পেশালাইজড হাসপাতাল',
+    nameEn: 'Padma Specialised Hospital',
+    kind: 'hospital',
+    division: 'Dhaka',
+    district: 'Dhaka',
+    thana: 'Uttara',
+    addressBn: 'সেক্টর ৪, উত্তরা, ঢাকা ১২৩০',
+    addressEn: 'Sector 4, Uttara, Dhaka 1230',
+    descriptionBn:
+      'উত্তরার একটি বিশেষায়িত বেসরকারি হাসপাতাল, বার্ন ইউনিটসহ। এটি প্রদর্শনীর জন্য বানানো তথ্য।',
+    descriptionEn:
+      'A specialised private hospital in Uttara, with a burn unit. This is demonstration data.',
+    lat: 23.8703,
+    lng: 90.3984,
+    phone: '+880255020001',
+    emergencyPhone: '+880255020999',
+    departments: ['CARD', 'MED', 'GYN', 'ORTHO', 'PAED', 'NEURO', 'ENT', 'DERM'],
+    // One of the two burn units (`FR-DEM-04`).
+    capabilities: [
+      'burn_unit',
+      'cardiac',
+      'stroke',
+      'dialysis',
+      'nicu',
+      'trauma_ot',
+      'blood_bank',
+      'ambulance',
+      'isolation',
+    ],
+    hasIcu: true,
+    size: 'large',
+    numeralStyle: 'latin',
+  },
+  {
+    slug: 'karnaphuli-general',
+    nameBn: 'কর্ণফুলী জেনারেল হাসপাতাল',
+    nameEn: 'Karnaphuli General Hospital',
+    kind: 'hospital',
+    division: 'Chattogram',
+    district: 'Chattogram',
+    thana: 'Panchlaish',
+    addressBn: 'পাঁচলাইশ, চট্টগ্রাম ৪২০৩',
+    addressEn: 'Panchlaish, Chattogram 4203',
+    descriptionBn:
+      'চট্টগ্রামের পাঁচলাইশে একটি মাঝারি বেসরকারি হাসপাতাল। হৃদরোগ, মেডিসিন, গাইনি, অর্থোপেডিক ও শিশু বিভাগ। এটি প্রদর্শনীর জন্য বানানো তথ্য।',
+    descriptionEn:
+      'A mid-size private hospital in Panchlaish, Chattogram: cardiology, medicine, gynaecology, orthopaedics and paediatrics. This is demonstration data.',
+    lat: 22.3606,
+    lng: 91.8206,
+    phone: '+880316010001',
+    emergencyPhone: '+880316010999',
+    departments: ['CARD', 'MED', 'GYN', 'ORTHO', 'PAED', 'ENT'],
+    capabilities: ['cardiac', 'dialysis', 'trauma_ot', 'blood_bank', 'ambulance'],
+    hasIcu: true,
+    size: 'mid',
+    numeralStyle: 'latin',
+  },
+  {
+    slug: 'jamuna-medical-college',
+    nameBn: 'যমুনা মেডিকেল কলেজ হাসপাতাল',
+    nameEn: 'Jamuna Medical College Hospital',
+    kind: 'government',
+    division: 'Dhaka',
+    district: 'Dhaka',
+    thana: 'Mohakhali',
+    addressBn: 'মহাখালী, ঢাকা ১২১২',
+    addressEn: 'Mohakhali, Dhaka 1212',
+    descriptionBn: 'মহাখালীর একটি সরকারি মেডিকেল কলেজ হাসপাতাল। এটি প্রদর্শনীর জন্য বানানো তথ্য।',
+    descriptionEn:
+      'A government medical college hospital in Mohakhali. This is demonstration data.',
+    lat: 23.7807,
+    lng: 90.4043,
+    phone: '+880255030001',
+    emergencyPhone: '+880255030999',
+    departments: ['CARD', 'MED', 'GYN', 'ORTHO', 'PAED', 'NEURO', 'ENT', 'DERM'],
+    // The second burn unit, and the widest capability list — which is what
+    // makes the emergency burn scenario (`PRD.md` §24 step 7) a real choice
+    // between two facilities rather than a single answer.
+    capabilities: [
+      'burn_unit',
+      'cardiac',
+      'cath_lab',
+      'stroke',
+      'dialysis',
+      'nicu',
+      'trauma_ot',
+      'blood_bank',
+      'ambulance',
+      'isolation',
+    ],
+    hasIcu: false,
+    size: 'large',
+    // A government outpatient counter reads serials aloud in Bengali.
+    numeralStyle: 'bengali',
+  },
+  {
+    slug: 'meghna-diagnostic',
+    nameBn: 'মেঘনা ডায়াগনস্টিক সেন্টার',
+    nameEn: 'Meghna Diagnostic Centre',
+    kind: 'diagnostic',
+    division: 'Dhaka',
+    district: 'Dhaka',
+    thana: 'Mirpur',
+    addressBn: 'সেকশন ৬, মিরপুর, ঢাকা ১২১৬',
+    addressEn: 'Section 6, Mirpur, Dhaka 1216',
+    descriptionBn:
+      'মিরপুরের একটি ডায়াগনস্টিক সেন্টার: পরীক্ষা-নিরীক্ষা, সঙ্গে মেডিসিন, গাইনি ও চর্মরোগের চেম্বার। এটি প্রদর্শনীর জন্য বানানো তথ্য।',
+    descriptionEn:
+      'A diagnostic centre in Mirpur: tests, with medicine, gynaecology and dermatology chambers. This is demonstration data.',
+    lat: 23.8069,
+    lng: 90.3687,
+    phone: '+880255040001',
+    emergencyPhone: null,
+    departments: ['MED', 'GYN', 'DERM'],
+    capabilities: ['blood_bank'],
+    hasIcu: false,
+    size: 'small',
+    numeralStyle: 'latin',
+  },
+  {
+    slug: 'buriganga-clinic',
+    nameBn: 'বুড়িগঙ্গা ক্লিনিক',
+    nameEn: 'Buriganga Clinic',
+    kind: 'clinic',
+    division: 'Dhaka',
+    district: 'Narayanganj',
+    thana: 'Narayanganj Sadar',
+    addressBn: 'চাষাঢ়া, নারায়ণগঞ্জ ১৪০০',
+    addressEn: 'Chashara, Narayanganj 1400',
+    descriptionBn:
+      'নারায়ণগঞ্জ সদরের একটি ছোট ক্লিনিক: মেডিসিন, গাইনি ও শিশু বিভাগ। এটি প্রদর্শনীর জন্য বানানো তথ্য।',
+    descriptionEn:
+      'A small clinic in Narayanganj Sadar: medicine, gynaecology and paediatrics. This is demonstration data.',
+    lat: 23.6238,
+    lng: 90.4993,
+    phone: '+880267610001',
+    emergencyPhone: '+880267610999',
+    departments: ['MED', 'GYN', 'PAED'],
+    capabilities: ['ambulance'],
+    // Outpatient only: the clinic roster has no ward staff (`data/people.ts`),
+    // so it has no beds at all. `FR-DEM-04` names three facilities with an ICU,
+    // and the two large Dhaka hospitals and Chattogram are those three (owner's
+    // ruling, 2026-09-21).
+    hasIcu: false,
+    size: 'small',
+    numeralStyle: 'bengali',
+  },
+];
+
+/** The facility the pitch is run at, and the one the tests build a graph from. */
+export function facility(slug: string): DemoFacility {
+  const found = DEMO_FACILITIES.find((entry) => entry.slug === slug);
+  if (found === undefined) {
+    throw new Error(
+      `"${slug}" is not in the declared demo set (CLAUDE.md §8). Add it to DEMO_FACILITIES or use one of: ${DEMO_FACILITIES.map((f) => f.slug).join(', ')}.`,
+    );
+  }
+  return found;
+}
