@@ -16,7 +16,7 @@
 
 import { expect, type Page } from '@playwright/test';
 
-import { codeAt, stepAt } from '../../backend/api/src/config/totp.js';
+import { codeAt, stepAt } from '../../testing/contracts/src/config/totp.js';
 
 interface Enrolled {
   readonly secret: string;

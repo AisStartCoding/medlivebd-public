@@ -5,7 +5,7 @@
  *
  * It used to be, in both `console.ts` and `globalSetup.ts`, and that was a
  * bug with teeth. `console.ts` imports `signToken` from the API, and
- * `backend/api/src/env.ts` merges the repository's `.env` into `process.env`
+ * `testing/contracts/src/env.ts` merges the repository's `.env` into `process.env`
  * as an import side effect. ESM evaluates imports before the importing
  * module's own body, so by the time `const DATABASE_URL = process.env[...]`
  * ran, `.env` had already put a *Supabase* URL there.

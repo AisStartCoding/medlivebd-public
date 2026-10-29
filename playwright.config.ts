@@ -111,7 +111,10 @@ export default defineConfig({
 
   webServer: [
     {
-      command: 'pnpm dev:api',
+      command:
+        process.platform === 'win32'
+          ? 'backend\\.venv\\Scripts\\python -m uvicorn backend.core.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers'
+          : 'backend/.venv/bin/python -m uvicorn backend.core.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers',
       url: `${API_URL}/healthz`,
       reuseExistingServer: REUSE_SERVERS,
       timeout: 120_000,

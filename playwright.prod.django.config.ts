@@ -7,7 +7,7 @@
  * Everything is `playwright.prod.config.ts`'s: the same specs, global setup,
  * built console and patient app, `DEMO_MODE=false`, the limited database
  * role and the production secrets. One server differs: the API on port 4000
- * is uvicorn serving `backend/django`, given the same `PRODUCTION_API_ENV`
+ * is uvicorn serving `backend`, given the same `PRODUCTION_API_ENV`
  * the Node API is given there.
  */
 
@@ -36,9 +36,9 @@ export default defineConfig({
     {
       command:
         process.platform === 'win32'
-          ? '.venv\\Scripts\\python -m uvicorn medlive.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers'
-          : '.venv/bin/python -m uvicorn medlive.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers',
-      cwd: 'backend/django',
+          ? 'backend\\.venv\\Scripts\\python -m uvicorn backend.core.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers'
+          : 'backend/.venv/bin/python -m uvicorn backend.core.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers',
+      cwd: '.',
       url: `${API_URL}/healthz`,
       reuseExistingServer: false,
       timeout: 120_000,

@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
 import { Client } from 'pg';
 
-import { signToken } from '../backend/api/src/config/jwt.js';
+import { signToken } from '../testing/contracts/src/config/jwt.js';
 
 import { approveManagementWrites } from './support/adminManagement.js';
 import { E2E_DATABASE_URL, assertLocalDatabase } from './support/database.js';

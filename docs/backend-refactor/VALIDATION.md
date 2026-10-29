@@ -1,5 +1,66 @@
 # Backend validation
 
+## Flat Python backend and grouped core — 28 October 2026
+
+This stage follows the owner's explicit request for Django/Python only and domain
+folders directly under `backend/`. Settings are `backend/core/settings.py`; shared
+helpers are grouped under security, database, HTTP, validation and observability.
+The old Django nesting, Node server entry, workers and Node serving commands are
+removed. Historical contract assertions/reference helpers and non-Python drivers
+are preserved under `testing/`, outside the backend runtime. Operator entry points
+now call the canonical Python services. No schema migration or product/UI redesign
+was introduced.
+
+Checks actually run:
+
+| Check | Result |
+| --- | --- |
+| Frozen pnpm install after workspace relocation | Passed; dependency versions retained |
+| Workspace typecheck | Passed |
+| Explicit browser-fixture TypeScript check | Passed |
+| Shared/domain/UI/schema (`pnpm test --maxWorkers=1`) | 6,228/6,228 across 98 files |
+| Native backend, including four operator-command regressions | 237/237 |
+| Selected Django HTTP contracts, 11 files | 335/335 |
+| Django system check and operator CLI help | Passed |
+| Full production browser rerun against the same built UIs | 88/88; one worker, zero retries |
+| Windows launcher syntax and production-preview restart | Passed |
+| Fresh runtime probes | 7/7 API, 8/8 pages; zero page exceptions |
+
+The standalone `pnpm test:backend` path was exercised after adding safe preparation
+of its dedicated local `_test` database. The owner connection builds fixtures and
+the application role executes the Python tests. The development database on port
+5433 was preserved. Shared/schema tests use their separate database. Run database
+suites sequentially: an initial concurrent native/HTTP attempt against the same
+API test database produced a duplicate-visit fixture error and a native clinical
+assertion; both isolated suites passed, without weakening assertions.
+
+The first full production browser run passed 87/88. The reception pilot's end
+confirmation closed, but its ended banner was not observed within the existing
+10-second assertion. An isolated run passed with HTTP 200 for chamber end, and the
+complete rerun passed all 88 with the same production builds. The cause was not
+established; no product fix is claimed. Failure-only end-request phase/status
+metadata now helps diagnose a recurrence, without recording URLs, IDs, bodies or
+tokens. Assertions, timeouts and retry settings are unchanged. Three test-only lab
+fetch interceptors also now handle URL inputs, allowing the explicit fixture
+TypeScript check to pass.
+
+The full historical 1,936-case compatibility diagnostic was not rerun in this
+stage. Its prior ten Node-process-spy limitations remain documented below and in
+`docs/django-migration/spy-tests.md`; native Python equivalents pass. The default
+`pnpm test` now covers shared/UI/schema projects and `pnpm verify` additionally
+runs native Python tests; it no longer starts the retired Node backend.
+
+Docker and Render definitions now target Python; SQL migration tooling has its own
+Node image target. No deployment was performed. Docker is unavailable on this
+host, so container image builds were not verified. Local Python startup and the
+production browser configuration were verified. Rollback is the preceding Git
+checkpoint; ignored source archives are retained locally. Generated vectors,
+virtual environments, credentials and runtime captures remain ignored.
+Browser tests generated 172 design captures; those were archived locally and the
+approved tracked reference files restored. This refactor does not replace them.
+
+The earlier checkpoint evidence follows.
+
 Baseline: 8,138/8,148 core cases; 341/344 selected Django contracts; Python 220/220;
 production browser 85/85. Ten core failures and three chamber-end failures are
 recorded in the local-copy audit and are not the historical Node-only spy cases.

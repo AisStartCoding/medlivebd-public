@@ -228,7 +228,7 @@ importers:
         specifier: ^5.0.1
         version: 5.0.1(@types/node@26.6.1)(jsdom@30.1.0(@noble/hashes@1.8.0))(vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
 
-  backend/api:
+  testing/contracts:
     dependencies:
       '@platform/config':
         specifier: workspace:*
@@ -279,12 +279,6 @@ importers:
       supertest:
         specifier: ^7.2.2
         version: 7.2.2
-
-  backend/workers:
-    dependencies:
-      '@platform/domain':
-        specifier: workspace:*
-        version: link:../../shared/domain
 
   database:
     dependencies:
@@ -480,6 +474,21 @@ importers:
       '@types/react-dom':
         specifier: ^19.3.0
         version: 19.3.0(@types/react@19.3.0)
+
+  testing/django:
+    dependencies:
+      '@platform/config':
+        specifier: workspace:*
+        version: link:../../shared/config
+      '@platform/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@platform/domain':
+        specifier: workspace:*
+        version: link:../../shared/domain
+      tsx:
+        specifier: ^4.23.13
+        version: 4.23.13
 
 packages:
 

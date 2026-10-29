@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 
 import { Client } from 'pg';
 
-import { hashPassword } from '../../backend/api/src/config/password.js';
+import { hashPassword } from '../../testing/contracts/src/config/password.js';
 
 import { E2E_DATABASE_URL, assertLocalDatabase } from './database.js';
 

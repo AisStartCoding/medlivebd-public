@@ -19,7 +19,7 @@ if (service === 'api') {
   process.env.DATABASE_URL = database.toString();
 }
 const packages = {
-  api: ['backend/api', 'tsx/cli', ['watch', 'src/server.ts']],
+  api: ['', '', []],
   patient: ['frontend/patient', 'next/dist/bin/next', ['dev', '--webpack', '--port', '3000']],
   console: ['frontend/console', 'next/dist/bin/next', ['dev', '--webpack', '--port', '3100']],
   site: ['frontend/site', 'next/dist/bin/next', ['dev', '--webpack', '--port', '3200']],
@@ -33,13 +33,13 @@ if (service !== 'api' && process.env.LOCAL_FRONTEND_MODE === 'preview') {
   args = ['start', '--port', args.at(-1)];
   process.env.NODE_ENV = 'production';
 }
-const django = service === 'api' && process.env.LOCAL_API_BACKEND !== 'Node';
+const django = service === 'api';
 if (django) {
-  directory = 'backend/django';
+  directory = '';
   args = [
     '-m',
     'uvicorn',
-    'medlive.asgi:application',
+    'backend.core.asgi:application',
     '--host',
     '127.0.0.1',
     '--port',
@@ -50,7 +50,12 @@ if (django) {
 const cwd = resolve(root, directory);
 const require = createRequire(resolve(cwd, 'package.json'));
 const command = django
-  ? resolve(cwd, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  ? resolve(
+      root,
+      'backend',
+      '.venv',
+      process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python',
+    )
   : process.execPath;
 const child = spawn(command, django ? args : [require.resolve(binary), ...args], {
   cwd,

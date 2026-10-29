@@ -1,3 +1,11 @@
+> Current implementation direction (owner, 28 October 2026): Django/Python is
+> the sole backend. Domain folders are directly inside `backend/`; Django settings
+> live in `backend/core/settings.py`, and technical helpers are grouped beneath
+> `backend/core/`. Node API/workers deployment is retired. Historical Node paths
+> below describe the original implementation; their remaining contract-reference
+> code is test-only under `testing/`. Product rules, SQL ownership and HTTP/live
+> contracts remain authoritative. See [the current backend map](../backend/README.md).
+
 # Backend Document
 
 ## National Healthcare Platform — Bangladesh

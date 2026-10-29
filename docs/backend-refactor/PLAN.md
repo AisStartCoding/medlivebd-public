@@ -1,3 +1,18 @@
+# Flattened Python backend follow-up
+
+1. Move domain owners to `backend/<domain>` and group technical helpers beneath
+   `backend/core/`; settings live at `backend/core/settings.py`.
+2. Rewrite imports and dynamic route references; retire the Node API and workers.
+   Preserve test-only reference code and the Django bridge under `testing/`.
+3. Port operator command entry points to the existing Python services. Update
+   launchers, Python environment, workspaces, CI, Docker and browser test commands.
+4. Verify native safety/parity/layering, operator dispatch, selected HTTP contracts,
+   shared/UI/schema checks, production browser workflows and local preview startup.
+5. Keep source rollback in Git and ignored old runtime directories locally; no schema
+   change, database reset outside dedicated test databases or deployment is required.
+
+The following is the completed plan from the earlier modularization checkpoint.
+
 # Backend implementation plan
 
 The downloaded brief is preserved in ../refactor/briefs/BACKEND.md. Every stage

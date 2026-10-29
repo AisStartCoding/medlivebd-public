@@ -110,7 +110,7 @@ export const ignores = [
   '**/test-results/**',
   // The Django API's virtualenv and its generated parity vectors.
   '**/.venv/**',
-  'backend/django/tests/parity/vectors/**',
+  'backend/tests/parity/vectors/**',
   '**/*.d.ts',
   'pnpm-lock.yaml',
 ];
@@ -154,7 +154,7 @@ export const base = tseslint.config(
           noWarnOnMultipleProjects: true,
           project: [
             'tsconfig.json',
-            '{frontend,backend,shared}/*/tsconfig.json',
+            '{frontend,testing,shared}/*/tsconfig.json',
             'database/tsconfig.json',
             'e2e/tsconfig.json',
           ],
@@ -276,7 +276,7 @@ export const base = tseslint.config(
           noWarnOnMultipleProjects: true,
           project: [
             'tsconfig.json',
-            '{frontend,backend,shared}/*/tsconfig.json',
+            '{frontend,testing,shared}/*/tsconfig.json',
             'frontend/*/jsconfig.json',
           ],
         }),
@@ -388,7 +388,7 @@ export const overrides = tseslint.config(
   // a codebase whose reducer is built on immutable state.
   // ---------------------------------------------------------------------------
   {
-    files: ['backend/*/src/middleware/**/*.ts'],
+    files: ['testing/contracts/src/middleware/**/*.ts'],
     rules: {
       'no-param-reassign': 'off',
     },

@@ -1,5 +1,12 @@
 # MedLiveBD implementation index
 
+Current backend layout: Django/Python only, with business domains directly inside
+`backend/` and grouped infrastructure/settings under `backend/core/`. The Node
+runtime is retired; historical test references live under `testing/`. See the
+[current backend guide](../../backend/README.md) and
+[latest verification](../backend-refactor/VALIDATION.md). Earlier sections below
+record the preceding checkpoints and their old paths/runtime options.
+
 This work targets `V:\STARTUP\medlivebd`, copied from the consolidated
 `HealthCare` master. It preserves the complete product and its authoritative
 requirements, supported Node runtime, SQL ledger and synthetic demo setup.

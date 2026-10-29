@@ -109,8 +109,8 @@ services:
   # privileges every time after. This is the only service that connects as the
   # owner besides the backup.
   migrate:
-    build: { context: .., target: api }
-    image: medlivebd-api
+    build: { context: .., target: database-tools }
+    image: medlivebd-database-tools
     logging: *logging
     command: ["sh", "-c", "pnpm db:migrate && pnpm db:role"]
     environment:
@@ -125,6 +125,7 @@ services:
     healthcheck: { disable: true }
 
   api:
+    build: { context: .., target: api }
     image: medlivebd-api
     restart: unless-stopped
     logging: *logging

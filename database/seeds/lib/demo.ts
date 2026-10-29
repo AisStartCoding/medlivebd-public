@@ -105,7 +105,7 @@ export function demoEmail(local: string, facilitySlug: string): string {
  * For the test fixtures' accounts, which must never sign in. The leading `!`
  * is the long-standing Unix convention for an account with no usable password,
  * and the API's verifier answers false for anything that is not a scrypt hash
- * (`backend/api/src/config/password.ts`).
+ * (`testing/contracts/src/config/password.ts`).
  */
 export const DISABLED_PASSWORD = '!disabled:no-password';
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/tsconfig",
   "display": "@platform node",
-  "_comment": "Node 20 services and scripts: backend/api, backend/workers, database, and the shared packages.",
+  "_comment": "Node tooling, shared TypeScript packages and test-only contract references. The backend runtime is Python.",
   "extends": "./base.json",
   "compilerOptions": {
     "types": ["node"]

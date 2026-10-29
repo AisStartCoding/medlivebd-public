@@ -45,8 +45,31 @@ const DEMONSTRATION_LINE = 'এটি একটি ডেমো';
 
 /** Fixture chambers put on the desk, to be taken back off it. */
 const onPicker: string[] = [];
+const endRequests = new WeakMap<Page, { phase: string; status?: number }[]>();
 
-test.afterEach(async () => {
+test.beforeEach(({ page }) => {
+  const requests: { phase: string; status?: number }[] = [];
+  endRequests.set(page, requests);
+  const isEnd = (url: string): boolean =>
+    /^\/api\/v1\/sessions\/[^/]+\/end$/.test(new URL(url).pathname);
+  page.on('request', (request) => {
+    if (isEnd(request.url())) requests.push({ phase: 'requested' });
+  });
+  page.on('response', (response) => {
+    if (isEnd(response.url())) requests.push({ phase: 'response', status: response.status() });
+  });
+  page.on('requestfailed', (request) => {
+    if (isEnd(request.url())) requests.push({ phase: 'transport-failed' });
+  });
+});
+
+test.afterEach(async ({ page }, info) => {
+  if (info.status !== info.expectedStatus) {
+    await info.attach('chamber-end-status', {
+      body: JSON.stringify({ endRequests: endRequests.get(page) ?? [] }),
+      contentType: 'application/json',
+    });
+  }
   await hideFromPicker(onPicker.splice(0));
 });
 

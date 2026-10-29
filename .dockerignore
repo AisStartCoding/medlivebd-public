@@ -17,3 +17,12 @@ deploy/.env
 deploy/backups
 deploy/backups-second
 storage
+
+# Local archives, Python environments and test-only contract references.
+.local
+**/.venv
+**/__pycache__
+**/.pytest_cache
+backend/tests
+backend/env
+testing

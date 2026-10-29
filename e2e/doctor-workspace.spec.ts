@@ -4,8 +4,8 @@ import { resolve } from 'node:path';
 
 import { expect, test, type Page } from '@playwright/test';
 
-import { signToken } from '../backend/api/src/config/jwt.js';
 import { bnCalendarDate } from '../shared/i18n/src/prescription.js';
+import { signToken } from '../testing/contracts/src/config/jwt.js';
 
 import { createConsoleSession, type ConsoleSession } from './support/console.js';
 import { openDoctor, signAndNext } from './support/doctor.js';

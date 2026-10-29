@@ -1,3 +1,19 @@
+# Current Python backend layout — 28 October 2026
+
+Owner requested Django/Python only and domain folders directly under `backend/`.
+The previous `backend/django/medlive/modules/` hierarchy is removed. Django project
+configuration is at `backend/core/settings.py`, with ASGI, URLs and ordered route
+composition alongside it. Core helpers are grouped into security, database, HTTP,
+validation and observability packages. The 17 domain owners sit directly under
+`backend/`; queue and platform folders are named `queues` and `platform_admin`
+to avoid Python standard-library collisions. See the [backend guide](../../backend/README.md).
+
+The Node server entry point, workers, runtime scripts and deployment option are
+retired. Only historical test references remain under `testing/`, with no serving
+command. Shared TypeScript rules used by the frontends and SQL migrations remain
+outside the backend. SQL schema ownership and existing request/security contracts
+are preserved. The old ownership notes below describe the earlier checkpoint.
+
 # Backend baseline
 
 Source baseline: master 0b4d968; the preceding local-copy audit is preserved at
@@ -27,8 +43,8 @@ Live/clinical/auth responses retain no-store and their authorization boundaries.
 
 ## Implemented ownership
 
-All 116 existing business-layer files now live under `backend/django/medlive/modules/`.
-The ordered composition remains `medlive/routes/__init__.py`; `test_seam.py` is
+All 116 existing business-layer files now live under `backend/`.
+The ordered composition remains `core/routes.py`; `test_seam.py` is
 still test-only. Core, pure domain rules, adapters and realtime transport retain
 shared ownership. No ORM models, new migrations, provider activations or Redis
 were introduced. Only real packages were created; no empty app/CRUD stubs.

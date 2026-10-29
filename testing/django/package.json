@@ -1,0 +1,15 @@
+{
+  "name": "@platform/django-contracts",
+  "private": true,
+  "type": "module",
+  "description": "Django HTTP contract harness and shared domain parity generators; not a backend runtime.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@platform/config": "workspace:*",
+    "@platform/contracts": "workspace:*",
+    "@platform/domain": "workspace:*",
+    "tsx": "^4.23.13"
+  }
+}

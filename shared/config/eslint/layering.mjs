@@ -18,7 +18,7 @@
 //   `import-x/no-restricted-paths` matches a zone with minimatch when the path
 //   looks like a glob, and with a real path comparison when it does not. On
 //   Windows the resolved glob contains backslashes, which minimatch reads as
-//   escape characters, so a zone written as `backend/api/src/services/**`
+//   escape characters, so a zone written as `testing/contracts/src/services/**`
 //   matches nothing on a developer's machine while still matching in Linux CI.
 //   Zones here are therefore plain directory (or file) paths — never globs. A
 //   rule that is quiet on one platform is worse than no rule at all.
@@ -35,7 +35,7 @@ const SERVER_LAYERS = ['routes', 'controllers', 'services', 'repositories'];
 const SIDE_EFFECT_DIRS = ['realtime', 'adapters', 'jobs'];
 
 /** Every app that follows the server layering (BACKEND.md §3, §8). */
-const SERVER_APPS = ['backend/api', 'backend/workers'];
+const SERVER_APPS = ['testing/contracts'];
 
 /**
  * Builds the `import-x/no-restricted-paths` zones for one server app: each layer
@@ -156,7 +156,7 @@ export const layering = [
   // rather than add to it.
   // ---------------------------------------------------------------------------
   {
-    files: ['{frontend,backend,shared}/*/src/**/*.{ts,tsx,js,jsx}', 'database/**/*.ts'],
+    files: ['{frontend,testing,shared}/*/src/**/*.{ts,tsx,js,jsx}', 'database/**/*.ts'],
     rules: {
       'import-x/no-restricted-paths': [
         'error',
@@ -175,13 +175,13 @@ export const layering = [
   // a service fails lint rather than review.
   // ---------------------------------------------------------------------------
   {
-    files: ['backend/*/src/**/*.ts'],
+    files: ['testing/contracts/src/**/*.ts'],
     ignores: [
-      'backend/*/src/repositories/**',
+      'testing/contracts/src/repositories/**',
       // The data layer describing itself: the pool, and the table types that
       // `Generated<>` and `ColumnType<>` come from.
-      'backend/*/src/config/db.ts',
-      'backend/*/src/config/schema.ts',
+      'testing/contracts/src/config/db.ts',
+      'testing/contracts/src/config/schema.ts',
     ],
     rules: {
       'no-restricted-imports': [

@@ -67,7 +67,7 @@ storage/
 # deployment's data and never belongs in the repository.
 *.dump
 
-# Python (the Django backend, backend/django)
+# Python (the Django backend, backend)
 .venv/
 __pycache__/
 *.pyc

@@ -3,7 +3,7 @@
 This independent `medlivebd` repository retains the consolidated healthcare
 codebase and history from source master `0b4d968`: patient PWA, hospital/staff
 workspaces, company website, Django API, SQL migrations, realtime/offline flows
-and the supported Node API/workers. **`master` is the development base.**
+and the Django/Python backend. **`master` is the development base.**
 
 The frontend/backend refactor follows both supplied briefs. Start with the
 [implementation and verification index](docs/refactor/README.md),
@@ -27,8 +27,7 @@ git switch master
 
 The launcher defaults to Django, installs pinned dependencies, generates missing
 local secrets, migrates, seeds only an empty database and verifies its schema.
-Existing demo data is preserved. Use `-ApiBackend Node` for the original API,
-`-SetupOnly` to prepare without starting, or `-SkipInstall` after dependencies are
+Existing demo data is preserved. Use `-SetupOnly` to prepare without starting, or `-SkipInstall` after dependencies are
 installed. Logs and ownership records are in ignored `.local/`. The `-Preview`
 option builds and serves production UI bundles against the local synthetic API.
 After a verified build, `-Preview -SkipBuild` reuses them. Omit `-Preview` for
@@ -42,7 +41,7 @@ On the inspected machine the existing demo database is on **localhost:5433**;
 ```
 
 The frontends and browser packages are JavaScript/JSX. Shared domain rules,
-translations, database tools and the original Node API remain TypeScript. Django
+translations, database tools and test-only contract references remain TypeScript. Django
 uses the existing SQL ledger: do not run Django ORM migrations.
 
 A two-sided healthcare platform: a Bangla-first patient PWA and a set of hospital
@@ -73,10 +72,13 @@ frontend/      Everything that runs in a browser
   patient/     Patient PWA (Part A)              — Next.js, Bangla-first, installable
   console/     Hospital consoles (Part B)        — Next.js, keyboard-first, offline-first
   site/        Marketing website (Part C)        — Next.js, server-rendered
-backend/       Everything that runs on a server
-  api/         Supported Node runtime            — Express 5, Socket.IO, the queue service
-  django/      Default API + domain modules       — Django/DRF, python-socketio
-  workers/     Background jobs                   — pg-boss
+backend/       Django/Python modular monolith
+  core/        settings.py, ASGI, routing and grouped shared infrastructure
+  identity/    Authentication and access
+  catalog/     Public discovery
+  queues/      Queue commands and sessions
+  ...          Other business domains, directly inside backend/
+testing/       Historical contract references and non-Python test drivers
 shared/        Imported by both sides
   domain/      Types, queue event log, reducer, ETA maths — pure, no I/O
   client/      Typed API client, session channel, offline queue
@@ -86,18 +88,18 @@ shared/        Imported by both sides
 database/      Migrations, seeds, schema scripts
 ```
 
-Three directories divided by where the code runs, and a fourth for the schema.
+Runtime code lives in frontend, backend and shared; schema and test tooling have their own directories.
 
-`shared/domain` holds the queue reducer, and both the API and the console
-import it unchanged. That is the mechanism that stops the server and the client
-ever disagreeing about what a queue event means (`FR-QUE-05`) — which is why it
-belongs to neither side and sits in neither. The boundaries are lint-enforced:
+`shared/domain` owns the browser queue rules. The Python backend's pure rules
+live in `backend/domain`; generated parity vectors check that both runtimes
+interpret queue events consistently (`FR-QUE-05`). The boundaries are enforced:
 `frontend/` cannot import from `backend/` or `database/`, and `shared/domain`
 imports nothing at all.
 
 ## Getting started
 
-Requires Node 22.19+ (24 recommended, and what CI runs) and Docker.
+Requires Node 22.19+, Corepack, Python 3.12+ and PostgreSQL with PostGIS.
+The database can run locally, in Docker or in WSL.
 
 ```bash
 corepack enable                 # pnpm version comes from package.json
@@ -110,8 +112,8 @@ docker compose up -d            # Postgres 16 + PostGIS on localhost:5432
 
 ```bash
 pnpm dev              # every app that has a dev server
-pnpm dev:api          # the API alone, with reload
-pnpm dev:django       # Django API from the root local .env, limited DB role
+pnpm dev:api          # the Django API alone
+pnpm dev:django       # alias for the Django API
 pnpm dev:site         # company website on :3200
 pnpm build
 pnpm typecheck
@@ -127,8 +129,8 @@ pnpm db:migrate       # apply pending migrations
 pnpm db:verify        # assert the DATABASE.md §0 invariants
 ```
 
-The test suite runs as three projects: `unit` needs nothing, `api` and `schema`
-need `docker compose up -d`. Run one with `pnpm vitest run --project unit`.
+The shared/UI and schema suites run with `pnpm test`; native backend safety/parity
+runs with `pnpm test:backend`. The schema and backend suites require the local test databases. Run one with `pnpm vitest run --project unit`.
 
 `pnpm db:seed`, `pnpm db:reset`, `pnpm dev:patient`, `pnpm dev:console` and
 `pnpm test:e2e` are implemented. Browser suites rebuild their configured database

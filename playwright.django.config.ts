@@ -6,10 +6,10 @@
  * Everything is `playwright.config.ts`'s: the same specs, the same global
  * setup (the local database reset and reseeded), the same console and
  * patient app on `next dev`, `retries: 0`, one worker. One server differs:
- * the API on port 4000 is uvicorn serving `backend/django`, not
+ * the API on port 4000 is uvicorn serving `backend`, not
  * `pnpm dev:api`. The frontends do not know which answers them.
  *
- * The specs sign tokens with the API's secrets (`backend/api/src/config/jwt.ts`
+ * The specs sign tokens with the API's secrets (`testing/contracts/src/config/jwt.ts`
  * reads them from the repository's `.env`), so the Django server is given the
  * same values. Its `DATABASE_URL` is set here, to the local database as the
  * API's own role, whatever `.env` says: the Supabase URL a `.env` may hold
@@ -28,7 +28,7 @@ import base from './playwright.config.js';
 
 // Merges the repository's `.env`, if any, into process.env as the Node API
 // does, so the secrets the specs sign with are the ones this server is given.
-import './backend/api/src/env.js';
+import './testing/contracts/src/env.js';
 
 assertLocalDatabase();
 
@@ -53,9 +53,9 @@ export default defineConfig({
     {
       command:
         process.platform === 'win32'
-          ? '.venv\\Scripts\\python -m uvicorn medlive.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers'
-          : '.venv/bin/python -m uvicorn medlive.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers',
-      cwd: 'backend/django',
+          ? 'backend\\.venv\\Scripts\\python -m uvicorn backend.core.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers'
+          : 'backend/.venv/bin/python -m uvicorn backend.core.asgi:application --host 127.0.0.1 --port 4000 --no-proxy-headers',
+      cwd: '.',
       url: `${API_URL}/healthz`,
       reuseExistingServer: false,
       timeout: 120_000,

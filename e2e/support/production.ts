@@ -3,7 +3,7 @@
  * (`playwright.prod.config.ts`).
  *
  * In production the API does not read `.env` — a server is given its
- * environment, and a file on disk is not it (`backend/api/src/env.ts`). So
+ * environment, and a file on disk is not it (`testing/contracts/src/env.ts`). So
  * every value is stated here. They are the values of a hospital's own server
  * (`deploy/docker-compose.yml`): no demonstration mode, no online payment
  * until a merchant account exists, messages recorded rather than sent until an

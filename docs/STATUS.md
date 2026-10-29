@@ -7,6 +7,23 @@ already in `CLAUDE.md` or derivable from `git log`.
 a fresh session costs one file read instead of a re-explanation, and it is only
 worth that if it is true.
 
+## Python-only backend flattening — 28 October 2026
+
+Owner requested flat domain folders and Django/Python only. Backend settings are
+now `backend/core/settings.py`. Shared helpers are grouped into security, database,
+HTTP, validation and observability. All business modules are directly under
+`backend/`; there is no `django/medlive/modules` wrapper. Node API/workers runtime
+and start commands are retired. Test-only historical references live in `testing/`.
+Operator commands use existing Python services. Launch, CI and deployment files
+follow the new layout. SQL migrations and synthetic development data are preserved.
+Verified: 237 native Python, 335 selected HTTP contracts, 6,228 shared/UI/schema
+cases and 88 production browser cases passed. Fresh startup passed 7 API and 8
+page probes. An earlier intermittent chamber-end browser failure and unverified
+Docker builds are recorded in `docs/backend-refactor/VALIDATION.md`. The app is
+left running in production-preview mode from the flat Python backend.
+
+The sections below are historical checkpoints and may name the old source layout.
+
 ## Current MedLiveBD refactor — 28 October 2026
 
 Backend cleanup: moved the obsolete global `controllers`, `services` and

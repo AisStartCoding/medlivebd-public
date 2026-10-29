@@ -7,9 +7,7 @@ same local demo database and app ports, so start only one checkout at a time.
 
 ## Windows launcher
 
-Run `./run.ps1 -Background`. Stop with `./run.ps1 -Stop`. Default API: Django;
-`-ApiBackend Node` selects the original API on the same database. Stop before
-switching. No schema conversion or data copying is needed for rollback.
+Run `./run.ps1 -Background`. Stop with `./run.ps1 -Stop`. The API is Django/Python only.
 
 Requirements: Node 22.19+ (24 recommended), Corepack, Python 3.12+ and PostgreSQL
 16 with PostGIS. pnpm and Python dependencies have committed lockfiles.
@@ -18,7 +16,6 @@ Docker when available, then Ubuntu WSL. Options:
 
 ```powershell
 .\run.ps1 -Background -DatabaseProvider Existing
-.\run.ps1 -Background -ApiBackend Node
 .\run.ps1 -SetupOnly
 .\run.ps1 -Background -SkipInstall
 .\run.ps1 -Background -DatabaseProvider WSL -WslDistribution Ubuntu-24.04
@@ -55,8 +52,8 @@ patient details. Payments and SMS are stand-ins. Do not start the old
 
 ```powershell
 corepack pnpm install --frozen-lockfile
-python -m venv backend/django/.venv
-backend/django/.venv/Scripts/python -m pip install -r backend/django/requirements.lock.txt
+python -m venv backend/.venv
+backend/.venv/Scripts/python -m pip install -r backend/requirements.lock.txt
 node scripts/setup-local.mjs --env-only
 corepack pnpm db:migrate
 corepack pnpm db:role
@@ -66,8 +63,8 @@ corepack pnpm dev:django
 ```
 
 `dev:django` uses root `.env` and the limited database role. Direct uvicorn startup
-in `django-migration/deployment.md` instead reads `backend/django/.env`: avoid
-mixing these configurations. Node's `dev:api` remains available. Django does not
+in `django-migration/deployment.md` instead reads `backend/.env`: avoid
+mixing these configurations. `dev:api` and `dev:django` both run Python. Django does not
 own tables; use `pnpm db:migrate`, never Django ORM migrations.
 
 ## Verification
@@ -75,7 +72,7 @@ own tables; use `pnpm db:migrate`, never Django ORM migrations.
 ```powershell
 corepack pnpm verify
 corepack pnpm build
-$env:DATABASE_URL_DJANGO_TEST = 'postgresql://healthcare:healthcare@localhost:5433/healthcare_django_api_test'
+$env:DATABASE_URL_DJANGO_TEST = 'postgresql://healthcare:healthcare@127.0.0.1:5433/healthcare_django_api_test'
 corepack pnpm test:django
 ```
 
@@ -88,8 +85,8 @@ observe Python; their Python equivalents are documented in
 After the compatibility run builds its database, run Python safety and parity:
 
 ```powershell
-$env:DATABASE_URL = 'postgresql://healthcare_api:test-only-api-role-not-a-real-credential@localhost:5433/healthcare_django_api_test'
-Push-Location backend/django
+$env:DATABASE_URL = 'postgresql://healthcare_api:test-only-api-role-not-a-real-credential@127.0.0.1:5433/healthcare_django_api_test'
+Push-Location backend
 .venv/Scripts/python -m pytest
 Pop-Location
 Remove-Item Env:DATABASE_URL
@@ -131,8 +128,8 @@ django-migration/deployment.md.
 
 ## Refactored source ownership
 
-The default API's business code lives under `backend/django/medlive/modules/`;
-`medlive/routes/__init__.py` composes the ordered contracts. SQL remains under
+The default API's business code lives under `backend/`;
+`core/routes.py` composes the ordered contracts. SQL remains under
 module repositories and `database/migrations/` owns schema changes. See the
 [backend map](backend-refactor/CURRENT_STATE.md). Admin and emergency tracking
 features own their request lifetimes; [cache policy](frontend-refactor/CACHE_POLICY.md)
@@ -151,8 +148,8 @@ this helper records only local root/static-JavaScript counts and bytes.
 
 Use `.\run.ps1 -Preview -Background` to build and serve production frontend
 bundles against the same local synthetic API/database. This avoids on-demand
-webpack compilation while showing the app. The default API remains Django;
-`-ApiBackend Node` is supported in this mode too. `-Preview -SkipBuild` reuses
+webpack compilation while showing the app. The API is Django/Python only.
+`-Preview -SkipBuild` reuses
 already verified builds; omit `-SkipBuild` after source changes. Omit `-Preview`
 for hot-reloading development. Stop the current apps before switching modes.
 Ownership checks, local-only provider/database guards and data preservation are

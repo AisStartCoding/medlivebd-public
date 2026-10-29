@@ -1,23 +1,6 @@
 # syntax=docker/dockerfile:1
-#
-# MedLiveBD — every service from one image definition (pilot step 26,
-# `FR-SEC-07`: a hospital's own server in Bangladesh). `deploy/docker-compose.yml`
-# builds three targets from it:
-#
-#   api       the API, the realtime socket and the hourly jobs, compiled to
-#             JavaScript in an image with production dependencies only (plan
-#             I1); also runs the one-shot `pnpm db:migrate && pnpm db:role`
-#             before the API starts
-#   console   the staff console (Next.js)
-#   patient   the patient app (Next.js)
-#
-# The web apps bake their API address in at build time (`NEXT_PUBLIC_*`), so
-# those two targets take it as build arguments; a changed domain is a rebuild.
-#
-# None of the three runs as root (plan 1.7). The image is built as root and
-# handed to `node`, the unprivileged account the base image ships: the code is
-# readable and not writable, and only the folders a service must write to are
-# its own — the uploaded files, and Next's cache.
+# Django API, separate SQL migration tools, and Next.js frontend targets.
+# Build the api, database-tools, console or patient target from the repository root.
 
 FROM node:24-bookworm-slim AS base
 ENV PNPM_HOME=/pnpm \
@@ -44,58 +27,35 @@ RUN pnpm install --frozen-lockfile \
 # stopped here, before a single migration ran.
 ENV pnpm_config_verify_deps_before_run=false
 
-# --- the API, compiled -----------------------------------------------------------
-#
-# TypeScript to JavaScript, for the API and the two shared packages it reads
-# (plan I1). Done here, where the whole workspace and its tools are installed,
-# and then left behind: the image that runs carries the output and none of
-# what made it.
-FROM deps AS api-build
-RUN pnpm build:api
-
-# --- the API -------------------------------------------------------------------
-#
-# From `base`, not from `deps`: no compiler, no test runner, no linter, no
-# browser driver and neither web app's framework. Only what the API and the
-# database scripts are run with (`--prod`, and only those two packages and
-# what they depend on).
-#
-# The server runs as compiled JavaScript (`start:compiled`). What runs once
-# and exits still runs from source through `tsx`, which is a dependency of the
-# two packages for that reason: the migrations and the API's role before the
-# server starts (`pnpm db:migrate && pnpm db:role`), and the commands an
-# operator types (`pnpm staff:create`, DEPLOY.md S3). A second or two of
-# start-up matters to none of them, and they keep one name on a laptop and on
-# a hospital's server.
-FROM base AS api
+# --- SQL migration tooling (separate from the Python API) ------------------------
+FROM base AS database-tools
 ENV NODE_ENV=production \
     pnpm_config_verify_deps_before_run=false
-COPY . .
-RUN pnpm install --frozen-lockfile --prod \
-      --filter "@platform/api..." --filter "@platform/database..." \
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY shared ./shared
+COPY database ./database
+RUN pnpm install --frozen-lockfile --prod --filter "@platform/database..." \
     && chown -R node:node /corepack
-COPY --from=api-build /app/shared/domain/dist shared/domain/dist
-COPY --from=api-build /app/shared/i18n/dist shared/i18n/dist
-COPY --from=api-build /app/backend/api/dist backend/api/dist
-# The uploaded files (`STORAGE_DIR`). Owned here so that the volume mounted
-# over it is created with the same owner; a volume made by an earlier,
-# root-run version needs handing over once (DEPLOY.md §S4).
-RUN mkdir -p /data/files && chown node:node /data/files
 USER node
+CMD ["pnpm", "db:migrate"]
+
+# --- Django API, Socket.IO and Python background jobs ---------------------------
+FROM python:3.13-slim-bookworm AS api
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DJANGO_SETTINGS_MODULE=backend.core.settings
+WORKDIR /app
+COPY backend/requirements.lock.txt ./requirements.lock.txt
+RUN pip install -r requirements.lock.txt
+COPY backend ./backend
+RUN useradd --system --uid 10001 --home /app medlive \
+    && mkdir -p /data/files && chown medlive:medlive /data/files
+USER medlive
 EXPOSE 4000
-# Readiness, not liveness: `/healthz` answers as long as the process is up,
-# and a container that cannot reach its database would be reported healthy.
-# Nothing restarts on this — it is what `docker compose ps` shows, and what the
-# web apps and the web server wait for before they start.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:4000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-# `node` itself, not `pnpm start:compiled`: the first process in a container
-# is the one `docker stop` signals. Under pnpm, pnpm took the SIGTERM and went,
-# and the server was killed behind it without running its shutdown, so a tap
-# in flight was cut off instead of finished (`server.ts`, FR-QUE-51). The same
-# command as `start:compiled`. The working folder stays /app, where the
-# `migrate` service's and an operator's `pnpm` commands are run from.
-CMD ["node", "--conditions=compiled", "backend/api/dist/server.js"]
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/readyz', timeout=4)"
+CMD ["python", "-m", "uvicorn", "backend.core.asgi:application", "--host", "0.0.0.0", "--port", "4000", "--no-proxy-headers", "--timeout-graceful-shutdown", "20"]
 
 # --- the web apps ----------------------------------------------------------------
 FROM deps AS web

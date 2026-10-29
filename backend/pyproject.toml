@@ -1,0 +1,19 @@
+[project]
+name = "medlive-api"
+version = "0.1.0"
+description = "MedLiveBD Django/DRF modular monolith with flat domain ownership."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "backend.core.test_settings"
+testpaths = ["tests"]
+pythonpath = [".."]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"
+markers = [
+  "db: needs the local test database (env/test.env)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"

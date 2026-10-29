@@ -18,7 +18,7 @@
  *
  * `/admin/dashboard` takes a date range and nothing else. The facility comes
  * off the caller's own principal, server-side, so there is no parameter here
- * to get wrong — see the header of `backend/api/src/routes/admin.routes.ts`.
+ * to get wrong — see the header of `testing/contracts/src/routes/admin.routes.ts`.
  */
 
 import { ApiClient, NetworkError } from '@platform/client/api';

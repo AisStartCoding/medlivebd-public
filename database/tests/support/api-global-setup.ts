@@ -25,7 +25,7 @@ import { ensureApiRole } from '../../scripts/lib/role.js';
 import { buildTestDatabase } from './build.js';
 
 /**
- * The same two values `backend/api/src/__tests__/support/env.setup.ts` builds
+ * The same two values `testing/contracts/src/__tests__/support/env.setup.ts` builds
  * its connection string from. Obviously fake, and test-only (`FR-SEC-08`).
  */
 export const API_TEST_ROLE = {

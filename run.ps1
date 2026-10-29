@@ -7,8 +7,6 @@ param(
     [switch]$SkipInstall,
     [switch]$Preview,
     [switch]$SkipBuild,
-    [ValidateSet('Django', 'Node')]
-    [string]$ApiBackend = 'Django',
     [string]$WslDistribution = 'Ubuntu',
     [ValidateSet('Auto', 'Docker', 'WSL', 'Existing')]
     [string]$DatabaseProvider = 'Auto'
@@ -18,7 +16,6 @@ Set-Location -LiteralPath $PSScriptRoot
 $localDir = Join-Path $PSScriptRoot '.local'
 $statePath = Join-Path $localDir 'run-state.json'
 $serviceScript = Join-Path $PSScriptRoot 'scripts/dev-service.mjs'
-$env:LOCAL_API_BACKEND = $ApiBackend
 $env:LOCAL_FRONTEND_MODE = if ($Preview) { 'preview' } else { 'development' }
 New-Item -ItemType Directory -Path $localDir -Force | Out-Null
 
@@ -67,16 +64,14 @@ $env:PATH = "$binDir;$env:PATH"
 & node scripts/setup-local.mjs --env-only
 if ($LASTEXITCODE -ne 0) { throw 'Local environment validation failed.' }
 if (!$SkipInstall) { Invoke-Pnpm install --frozen-lockfile }
-if ($ApiBackend -eq 'Django') {
-    $pythonPath = Join-Path $PSScriptRoot 'backend/django/.venv/Scripts/python.exe'
-    if (!(Test-Path -LiteralPath $pythonPath)) {
-        & python -m venv (Join-Path $PSScriptRoot 'backend/django/.venv')
-        if ($LASTEXITCODE -ne 0) { throw 'Python 3.12+ is required for the Django API.' }
-    }
-    if (!$SkipInstall) {
-        & $pythonPath -m pip install -r backend/django/requirements.lock.txt
-        if ($LASTEXITCODE -ne 0) { throw 'Django dependency installation failed.' }
-    }
+$pythonPath = Join-Path $PSScriptRoot 'backend/.venv/Scripts/python.exe'
+if (!(Test-Path -LiteralPath $pythonPath)) {
+    & python -m venv (Join-Path $PSScriptRoot 'backend/.venv')
+    if ($LASTEXITCODE -ne 0) { throw 'Python 3.12+ is required for the Django API.' }
+}
+if (!$SkipInstall) {
+    & $pythonPath -m pip install -r backend/requirements.lock.txt
+    if ($LASTEXITCODE -ne 0) { throw 'Django dependency installation failed.' }
 }
 
 # Reuse the configured local database first; otherwise start Docker or WSL.

@@ -2,7 +2,7 @@
  * The environment the browser suites run with against the Django API
  * (`playwright.django.config.ts`), set before anything reads it.
  *
- * Throwaway local values, as `backend/django/env/test.env` holds for the API
+ * Throwaway local values, as `backend/env/test.env` holds for the API
  * suite: secrets named as not real, and the local database. A value already
  * in the environment is kept, so a machine with its own `.env` signs with its
  * own. Nothing here points anywhere but this machine.

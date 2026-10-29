@@ -1,0 +1,30 @@
+{
+  "name": "@platform/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Test-only historical contract reference and fixtures for the Django API; no server runtime.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@platform/config": "workspace:*",
+    "@platform/domain": "workspace:*",
+    "@platform/i18n": "workspace:*",
+    "express": "^5.2.1",
+    "jose": "^6.2.12",
+    "kysely": "^0.29.6",
+    "pg": "^8.23.0",
+    "pino": "^10.3.1",
+    "socket.io": "^4.8.3",
+    "tsx": "^4.23.13",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/pg": "^8.23.1",
+    "@types/supertest": "^7.2.1",
+    "socket.io-client": "^4.8.3",
+    "supertest": "^7.2.2"
+  }
+}

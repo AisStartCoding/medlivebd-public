@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 const consoleDir = fileURLToPath(new URL('.', import.meta.url));
 const root = resolve(consoleDir, '../..');
 const require = createRequire(import.meta.url);
-const apiRequire = createRequire(join(root, 'backend/api/package.json'));
+const apiRequire = createRequire(join(root, 'testing/contracts/package.json'));
 const { build } = createRequire(apiRequire.resolve('tsx/package.json'))('esbuild');
 const postcss = require('postcss');
 const tailwind = require('@tailwindcss/postcss');
